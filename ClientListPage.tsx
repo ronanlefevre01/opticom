@@ -113,9 +113,7 @@ export default function ClientListPage() {
   const [selectedClients, setSelectedClients] = useState<string[]>([]); // téléphones sanitisés
   const [smsFilter, setSmsFilter] = useState<SMSCategory | 'Tous'>('Tous');
 
-  const [customMessages, setCustomMessages] = useState<
-    Record<string, string | { title?: string; content: string }>
-  >({});
+  const [customMessages, setCustomMessages] = useState<Record<string, string | { title?: string; content: string }>>({});
 
   // Progress (même look que AddClientPage)
   const [sending, setSending] = useState(false);
@@ -127,6 +125,9 @@ export default function ClientListPage() {
 
   const [customModalVisible, setCustomModalVisible] = useState(false);
   const [customText, setCustomText] = useState('');
+
+  // ✅ nouvelle modale de choix de type (web-friendly)
+  const [typeModalVisible, setTypeModalVisible] = useState(false);
 
   useEffect(() => {
     const loadData = async () => {
@@ -179,19 +180,6 @@ export default function ClientListPage() {
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
   };
 
-  /* ---- Supprimer la sélection ---- */
-  const deleteSelection = async () => {
-    if (selectedClients.length === 0) return;
-    const ok = await confirmAsync('Supprimer la sélection ?', `${selectedClients.length} client(s) seront supprimés.`);
-    if (!ok) return;
-    const setSel = new Set(selectedClients);
-    const updated = clients.filter(c => !setSel.has(sanitizePhone(c.telephone)));
-    setClients(updated);
-    setFilteredClients(updated);
-    setSelectedClients([]);
-    await AsyncStorage.setItem('clients', JSON.stringify(updated));
-  };
-
   const resetClientHistory = async (rawPhone: string) => {
     const ok = await confirmAsync('Réinitialiser l’historique ?', 'Effacer l’historique des SMS de ce client ?', 'Réinitialiser');
     if (!ok) return;
@@ -222,19 +210,13 @@ export default function ClientListPage() {
       .replace(/\s+/g, ' ')
       .trim();
 
+  /* --------- Choix type (modale au lieu d'Alert) --------- */
   const openSmsDialog = () => {
     if (selectedClients.length === 0) {
       Alert.alert('Info', 'Sélectionne au moins un client.');
       return;
     }
-    Alert.alert('Type de message', 'Choisissez un type', [
-      { text: 'Lunettes',  onPress: () => sendBatch('Lunettes') },
-      { text: 'SAV',       onPress: () => sendBatch('SAV') },
-      { text: 'Lentilles', onPress: () => sendBatch('Lentilles') },
-      { text: 'Commande',  onPress: () => sendBatch('Commande') },
-      { text: 'Personnalisé', onPress: () => setCustomModalVisible(true) },
-      { text: 'Annuler', style: 'cancel' },
-    ]);
+    setTypeModalVisible(true);
   };
 
   const sendOne = async ({
@@ -280,6 +262,7 @@ export default function ClientListPage() {
     const signature = await getSignatureFromSettings();
 
     setSending(true);
+    setTypeModalVisible(false);
     setSendError(null);
     setSendStep('prep');
     setProgressTotal(batch.length);
@@ -434,18 +417,55 @@ export default function ClientListPage() {
       />
 
       {selectedClients.length > 0 && (
-        <View style={{ gap: 10, marginTop: 14 }}>
+        <View style={{ marginTop: 14 }}>
           <TouchableOpacity style={styles.smsButton} onPress={openSmsDialog}>
             <Text style={styles.smsText}>Envoyer SMS</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.deleteSelBtn} onPress={deleteSelection}>
-            <Text style={styles.deleteSelText}>🗑 Supprimer la sélection</Text>
           </TouchableOpacity>
         </View>
       )}
 
-      {/* Personnalisé */}
-      <Modal visible={customModalVisible} transparent animationType="fade" onRequestClose={() => setCustomModalVisible(false)}>
+      {/* Modale de choix du type de message */}
+      <Modal
+        visible={typeModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setTypeModalVisible(false)}
+      >
+        <View style={styles.customOverlay}>
+          <View style={styles.customCard}>
+            <Text style={styles.customTitle}>Type de message</Text>
+            {(['Lunettes','SAV','Lentilles','Commande'] as const).map((t) => (
+              <TouchableOpacity
+                key={t}
+                style={styles.typeBtn}
+                onPress={() => sendBatch(t)}
+              >
+                <Text style={styles.customBtnText}>{t}</Text>
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity
+              style={[styles.typeBtn, { backgroundColor: '#555' }]}
+              onPress={() => { setTypeModalVisible(false); setCustomModalVisible(true); }}
+            >
+              <Text style={styles.customBtnText}>Personnalisé</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.typeBtn, { backgroundColor: '#3b0d0d' }]}
+              onPress={() => setTypeModalVisible(false)}
+            >
+              <Text style={[styles.customBtnText, { color: '#ffb4b4' }]}>Annuler</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Modale “Personnalisé” */}
+      <Modal
+        visible={customModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setCustomModalVisible(false)}
+      >
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
             <Text style={styles.customTitle}>Message personnalisé</Text>
@@ -459,10 +479,16 @@ export default function ClientListPage() {
               onChangeText={setCustomText}
             />
             <View style={styles.customRow}>
-              <TouchableOpacity style={[styles.customBtn, { backgroundColor: '#28a745' }]} onPress={() => { setCustomModalVisible(false); setTimeout(() => sendBatch('__custom__'), 60); }}>
+              <TouchableOpacity
+                style={[styles.customBtn, { backgroundColor: '#28a745' }]}
+                onPress={() => { setCustomModalVisible(false); setTimeout(() => sendBatch('__custom__'), 60); }}
+              >
                 <Text style={styles.customBtnText}>Envoyer</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.customBtn, { backgroundColor: '#555' }]} onPress={() => setCustomModalVisible(false)}>
+              <TouchableOpacity
+                style={[styles.customBtn, { backgroundColor: '#555' }]}
+                onPress={() => setCustomModalVisible(false)}
+              >
                 <Text style={styles.customBtnText}>Fermer</Text>
               </TouchableOpacity>
             </View>
@@ -519,10 +545,8 @@ const styles = StyleSheet.create({
   smsHistoryText: { fontSize: 13, color: '#aaa' },
   smsButton: { backgroundColor: '#00BFFF', padding: 14, borderRadius: 10, alignItems: 'center' },
   smsText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
-  deleteSelBtn: { backgroundColor: '#3b0d0d', padding: 12, borderRadius: 10, alignItems: 'center' },
-  deleteSelText: { color: '#ff6b6b', fontWeight: 'bold' },
 
-  // Custom modal
+  // Custom/modal shared styles
   customOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)' },
   customCard: { backgroundColor: '#222', padding: 22, borderRadius: 12, width: '85%' },
   customTitle: { color: '#fff', fontWeight: 'bold', fontSize: 16, marginBottom: 6 },
@@ -531,6 +555,7 @@ const styles = StyleSheet.create({
   customRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 12, gap: 10 },
   customBtn: { flex: 1, paddingVertical: 10, borderRadius: 8, alignItems: 'center' },
   customBtnText: { color: '#fff', fontWeight: '700' },
+  typeBtn: { paddingVertical: 12, borderRadius: 8, alignItems: 'center', backgroundColor: '#007AFF', marginTop: 8 },
 
   // Progress modal
   modalOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)' },
