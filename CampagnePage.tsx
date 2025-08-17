@@ -1,7 +1,8 @@
+// CampagnePage.tsx
 import React, { useEffect, useState } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, Alert, StyleSheet,
-  Modal, TextInput, ActivityIndicator, Platform,
+  Modal, TextInput, ActivityIndicator,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native';
@@ -188,6 +189,10 @@ export default function CampagnePage() {
   const [progressTotal, setProgressTotal] = useState(0);
   const [batchSummary, setBatchSummary] = useState<{sent:number; skipped:number; failed:number} | null>(null);
 
+  // ✅ Preview modal state (fix for web & native)
+  const [previewVisible, setPreviewVisible] = useState(false);
+  const [previewText, setPreviewText] = useState('');
+
   useEffect(() => {
     const loadData = async () => {
       const msgData = await AsyncStorage.getItem('messages');
@@ -213,9 +218,17 @@ export default function CampagnePage() {
     return messages[id]?.content || found?.messageParDefaut || '';
   };
 
-  const handlePreview = (id: string) => {
-    const msg = getMessageById(id);
-    Alert.alert('Prévisualisation', msg.replace('{prenom}', 'Jean').replace('{nom}', 'Dupont'));
+  // 🔧 NEW: robust preview using a modal (not Alert)
+  const handlePreview = async (id: string) => {
+    const raw = getMessageById(id);
+    const sig = await getSignatureFromSettings();
+    // If it's a promo campaign, show STOP in preview too
+    const isPromo = campagnesSaisonnieres.some(c => c.id === id && c.type === 'promotionnelle');
+    let text = raw.replace('{prenom}', 'Jean').replace('{nom}', 'Dupont');
+    text = appendSignature(text, sig);
+    if (isPromo) text = ensureStopClause(text);
+    setPreviewText(text || '— (message vide) —');
+    setPreviewVisible(true);
   };
 
   const handleParametrage = (id: string) => {
@@ -315,7 +328,14 @@ export default function CampagnePage() {
           skipped++; setProgressCount((p)=>p+1); continue;
         }
 
-        let messageFinal = getMessageForClient(messageTemplate, client);
+        let messageFinal = (messageTemplate || '')
+          .replace('{prenom}', client.prenom || '')
+          .replace('{nom}', client.nom || '')
+          .replace(/\s*\{prenom\}\s*/g, '')
+          .replace(/\s*\{nom\}\s*/g, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+
         messageFinal = appendSignature(messageFinal, signature);
         if (isPromo) messageFinal = ensureStopClause(messageFinal);
         if (!messageFinal) { failed++; setProgressCount((p)=>p+1); continue; }
@@ -407,7 +427,7 @@ export default function CampagnePage() {
       </View>
 
       {/* Modal édition message */}
-      <Modal visible={editMessageVisible} transparent animationType="slide">
+      <Modal visible={editMessageVisible} transparent animationType="slide" onRequestClose={()=>setEditMessageVisible(false)}>
         <View style={{ flex: 1, backgroundColor: '#000000aa', justifyContent: 'center', padding: 20 }}>
           <View style={{ backgroundColor: '#fff', padding: 20, borderRadius: 10 }}>
             <Text style={{ fontWeight: 'bold', marginBottom: 10 }}>Modifier le message</Text>
@@ -456,8 +476,7 @@ export default function CampagnePage() {
                   key={key}
                   onPress={() => setActiveFilter(key)}
                   style={{
-                    padding: 6,
-                    borderRadius: 6,
+                    padding: 6, borderRadius: 6,
                     backgroundColor: activeFilter === key ? '#007AFF' : '#ccc',
                     flex: 1, alignItems: 'center',
                   }}
@@ -526,6 +545,29 @@ export default function CampagnePage() {
         </View>
       </Modal>
 
+      {/* ✅ Preview Modal (works on Web & Native) */}
+      <Modal
+        visible={previewVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setPreviewVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.previewCard}>
+            <Text style={styles.previewTitle}>Prévisualisation</Text>
+            <ScrollView style={{ maxHeight: 200, alignSelf: 'stretch' }}>
+              <Text style={styles.previewText}>{previewText}</Text>
+            </ScrollView>
+            <TouchableOpacity
+              style={[styles.modalActionBtn, { backgroundColor: '#007AFF', marginTop: 12 }]}
+              onPress={() => setPreviewVisible(false)}
+            >
+              <Text style={styles.modalActionText}>Fermer</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
       {/* Modale de progression — même look qu’AddClientPage */}
       <Modal
         visible={sending}
@@ -555,15 +597,6 @@ export default function CampagnePage() {
 
               {sendStep === 'error' && <Text style={styles.progressErr}>✗ {sendError || 'Erreur inconnue'}</Text>}
             </View>
-
-            {sendStep === 'error' && (
-              <TouchableOpacity
-                style={[styles.modalActionBtn, { backgroundColor: '#ff3b30', marginTop: 12 }]}
-                onPress={() => setSending(false)}
-              >
-                <Text style={styles.modalActionText}>Fermer</Text>
-              </TouchableOpacity>
-            )}
           </View>
         </View>
       </Modal>
@@ -582,7 +615,7 @@ const styles = StyleSheet.create({
   smallButton: { flexGrow: 1, backgroundColor: '#333', padding: 10, borderRadius: 6, marginVertical: 4, alignItems: 'center' },
   buttonText: { color: '#fff', fontWeight: 'bold', fontSize: 14 },
 
-  // Progress modal
+  // Overlay / cards
   modalOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)' },
   progressCard: { backgroundColor: '#222', padding: 22, borderRadius: 12, width: '80%', alignItems: 'center' },
   progressTitle: { color: '#fff', fontWeight: '700', fontSize: 16, marginBottom: 10 },
@@ -591,4 +624,9 @@ const styles = StyleSheet.create({
   progressErr: { color: '#ff6b6b', marginTop: 6, fontWeight: '700' },
   modalActionBtn: { paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8 },
   modalActionText: { color: '#fff', fontWeight: '700' },
+
+  // Preview modal
+  previewCard: { backgroundColor: '#222', padding: 22, borderRadius: 12, width: '85%', alignItems: 'center' },
+  previewTitle: { color: '#fff', fontWeight: '700', fontSize: 16, marginBottom: 10, alignSelf: 'flex-start' },
+  previewText: { color: '#fff', fontSize: 15, lineHeight: 22 },
 });
