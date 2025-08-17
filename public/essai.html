@@ -36,11 +36,12 @@
       <div class="row">
         <div>
           <label for="siret">SIRET</label>
-          <input id="siret" name="siret" inputmode="numeric" pattern="\\d{14}" maxlength="14" placeholder="14 chiffres" required>
+          <!-- pattern: un seul backslash -->
+          <input id="siret" name="siret" inputmode="numeric" pattern="\d{14}" maxlength="14" placeholder="14 chiffres" required>
         </div>
         <div>
           <label for="phone">Téléphone</label>
-          <input id="phone" name="phone" inputmode="tel" placeholder="ex : 06XXXXXXXX" required>
+          <input id="phone" name="phone" type="tel" placeholder="ex : 06XXXXXXXX" required>
         </div>
       </div>
 
@@ -64,8 +65,8 @@
 
 <script>
   // ---------- CONFIG ----------
-  // Utilise l'endpoint OptiComAdmin (mettre ton domaine si différent)
-  const API_URL = 'https://opti-admin.vercel.app/api/trial-requests';
+  // Appelle toujours l’API du même domaine que la page (dev, préprod, prod)
+  const API_URL = location.origin + '/api/trial-requests';
 
   // ---------- Utils ----------
   const qs = new URLSearchParams(location.search);
@@ -95,6 +96,9 @@
   $('phone').addEventListener('blur', (e) => e.target.value = normalizePhone(e.target.value));
   $('siret').addEventListener('input', (e) => e.target.value = e.target.value.replace(/\D/g,'').slice(0,14));
 
+  // Debug global erreurs JS (si jamais rien ne part)
+  window.addEventListener('error', (ev) => console.error('JS error:', ev.message, ev.error));
+
   // ---------- Submit ----------
   $('trialForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -122,19 +126,26 @@
     try {
       btn.disabled = true;
       status.textContent = 'Envoi…';
+      console.log('POST', API_URL, payload);
 
       const res = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type':'application/json' },
-        body: JSON.stringify(payload),
-        mode: 'cors'
+        body: JSON.stringify(payload)
       });
 
-      if (!res.ok) throw new Error('HTTP ' + res.status);
+      // essaie de lire l'erreur serveur si dispo
+      if (!res.ok) {
+        let msg = 'HTTP ' + res.status;
+        try {
+          const j = await res.json();
+          if (j?.error) msg += ' – ' + j.error;
+        } catch {}
+        throw new Error(msg);
+      }
+
       status.textContent = '✅ Demande envoyée. Vous recevrez vos accès par e-mail.';
       status.classList.add('ok');
-
-      // Optionnel: reset du formulaire
       $('trialForm').reset();
     } catch (err) {
       console.error(err);
