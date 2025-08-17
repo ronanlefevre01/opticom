@@ -403,7 +403,7 @@ export default function AddClientPage() {
       />
 
       <TouchableOpacity style={styles.smsButton} onPress={handleExpressSMS}>
-        <Text style={styles.buttonText}>📤 Envoi express</Text>
+        <Text style={styles.buttonText}>📤 Envoi express cocher la case de consentement service</Text>
       </TouchableOpacity>
 
       <Text style={styles.label}>Nom</Text>

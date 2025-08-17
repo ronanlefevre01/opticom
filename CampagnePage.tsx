@@ -1,13 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
-  View,
-  Text,
-  ScrollView,
-  TouchableOpacity,
-  Alert,
-  StyleSheet,
-  Modal,
-  TextInput,
+  View, Text, ScrollView, TouchableOpacity, Alert, StyleSheet,
+  Modal, TextInput, ActivityIndicator, Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native';
@@ -15,10 +9,17 @@ import { consumeCredits } from './CreditManager';
 import { Client } from './types';
 import API_BASE from './src/config/api';
 
-/* ===================== ENDPOINTS SERVEUR ===================== */
+/* ===================== ENDPOINTS ===================== */
 const SEND_SMS_ENDPOINT = `${API_BASE}/send-sms`;
 
-/* ===================== Helpers communs ===================== */
+/* ===================== Helpers ===================== */
+const sanitizePhone = (raw: string) => {
+  let p = (raw || '').replace(/[^\d+]/g, '');
+  if (p.startsWith('+33')) p = '0' + p.slice(3);
+  return p.replace(/\D/g, '');
+};
+const isPhone10 = (p: string) => /^\d{10}$/.test(p);
+
 const normalizeSender = (raw?: string) => {
   let s = String(raw ?? 'OptiCOM').replace(/[^a-zA-Z0-9]/g, '');
   if (s.length < 3) s = 'OptiCOM';
@@ -39,15 +40,16 @@ const getSenderLabelFromSettings = async (): Promise<string> => {
   return normalizeSender('OptiCOM');
 };
 
-const getLicenceIdFromStorage = async (): Promise<string | null> => {
+const getLicenceFromStorage = async (): Promise<{ licenceId: string | null; cle: string | null }> => {
   try {
     const raw = await AsyncStorage.getItem('licence');
-    if (!raw) return null;
+    if (!raw) return { licenceId: null, cle: null };
     const lic = JSON.parse(raw);
-    const id = String(lic?.id || lic?.opticien?.id || '').trim();
-    return id || null;
+    const licenceId = String(lic?.id || lic?.opticien?.id || '').trim() || null;
+    const cle = String(lic?.licence || '').trim() || null;
+    return { licenceId, cle };
   } catch {
-    return null;
+    return { licenceId: null, cle: null };
   }
 };
 
@@ -78,7 +80,10 @@ const appendSignature = (msg: string, sig: string) => {
   return `${m}${sep}${s}`;
 };
 
-/* ===================== Crédit via serveur ===================== */
+const ensureStopClause = (m: string) =>
+  /stop\s+au\s+36111/i.test(m) ? m : `${m} STOP au 36111`;
+
+/* ===================== Crédit (server pre-check) ===================== */
 const fetchCreditsFromServer = async (licenceId: string): Promise<number | null> => {
   const urls = [
     `${API_BASE}/licence/credits?licenceId=${encodeURIComponent(licenceId)}`,
@@ -96,57 +101,51 @@ const fetchCreditsFromServer = async (licenceId: string): Promise<number | null>
       const credits =
         data?.credits ?? data?.remaining ?? data?.solde ?? (typeof data === 'number' ? data : null);
       if (typeof credits === 'number') return credits;
-    } catch (e) {
-      lastErr = e;
-    }
+    } catch (e) { lastErr = e; }
   }
   console.warn('Credits endpoint unavailable:', lastErr?.message || lastErr);
   return null;
 };
 
-/* ===================== Envoi HTTP ===================== */
-const sendTransactionalOrPromoSMS = async ({
-  phoneNumber,
-  message,
-  emetteur,
-  licenceId,
+/* ===================== HTTP send ===================== */
+const sendSMS = async ({
+  phoneNumber, message, emetteur, licenceId, cle,
 }: {
-  phoneNumber: string;
-  message: string;
-  emetteur: string;
-  licenceId: string;
+  phoneNumber: string; message: string; emetteur?: string;
+  licenceId: string | null; cle: string | null;
 }) => {
-  const payload = { phoneNumber, message, emetteur, licenceId };
+  const payload: any = { phoneNumber, message };
+  if (emetteur) payload.emetteur = emetteur;
+  if (licenceId) payload.licenceId = licenceId;
+  if (cle) payload.cle = cle;
+
   const resp = await fetch(SEND_SMS_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
   const data = await resp.json().catch(() => ({} as any));
-  if (!resp.ok || !data?.success) {
-    const err =
-      data?.error ||
-      (resp.status === 403 ? 'Licence introuvable / crédits insuffisants.' : "Échec de l’envoi.");
+  if (!resp.ok || (data?.success === false)) {
+    const err = data?.error || (resp.status === 403 ? 'Licence/crédits/consentement.' : "Échec envoi.");
     throw new Error(err);
   }
-  return data;
+  return true;
 };
 
 /* ===================== Modèles ===================== */
 const campagnes = [
-  { id: 'anniversaire', titre: '🎂 Anniversaire', messageParDefaut:
-    "Bonjour {prenom}, l'équipe de votre opticien vous souhaite un joyeux anniversaire ! Profitez de -20% sur vos lunettes jusqu'à la fin du mois.",
-    automatique: true },
-  { id: 'lentilles', titre: '👁️ Lentilles', messageParDefaut:
-    "Bonjour {prenom}, c'est bientôt le moment de renouveler vos lentilles. Profitez de -15% en commandant aujourd'hui !" },
-  { id: 'noel', titre: '🎄 Noël', messageParDefaut:
-    "Bonjour {prenom}, pour Noël, profitez de -25% sur une deuxième paire. Offre valable jusqu'au 24 décembre." },
-  { id: 'soldes_ete', titre: "☀️ Soldes d'été", messageParDefaut:
-    "Bonjour {prenom}, les soldes d'été commencent ! Jusqu'à -50% sur une sélection de montures. Venez vite en magasin !" },
-  { id: 'soldes_hiver', titre: "❄️ Soldes d'hiver", messageParDefaut:
-    "Bonjour {prenom}, ne manquez pas les soldes d'hiver : jusqu'à -40% sur vos lunettes préférées !" },
-  { id: 'rentree', titre: '🎓 Rentrée scolaire', messageParDefaut:
-    "Bonjour {prenom}, c'est la rentrée ! Offrez à vos enfants des lunettes stylées avec -20% sur les montures enfant." },
+  { id: 'anniversaire', titre: '🎂 Anniversaire',
+    messageParDefaut: "Bonjour {prenom}, l'équipe de votre opticien vous souhaite un joyeux anniversaire ! Profitez de -20% sur vos lunettes jusqu'à la fin du mois." },
+  { id: 'lentilles', titre: '👁️ Lentilles',
+    messageParDefaut: "Bonjour {prenom}, c'est bientôt le moment de renouveler vos lentilles. Profitez de -15% en commandant aujourd'hui !" },
+  { id: 'noel', titre: '🎄 Noël',
+    messageParDefaut: "Bonjour {prenom}, pour Noël, profitez de -25% sur une deuxième paire. Offre valable jusqu'au 24 décembre." },
+  { id: 'soldes_ete', titre: "☀️ Soldes d'été",
+    messageParDefaut: "Bonjour {prenom}, les soldes d'été commencent ! Jusqu'à -50% sur une sélection de montures. Venez vite en magasin !" },
+  { id: 'soldes_hiver', titre: "❄️ Soldes d'hiver",
+    messageParDefaut: "Bonjour {prenom}, ne manquez pas les soldes d'hiver : jusqu'à -40% sur vos lunettes préférées !" },
+  { id: 'rentree', titre: '🎓 Rentrée scolaire',
+    messageParDefaut: "Bonjour {prenom}, c'est la rentrée ! Offrez à vos enfants des lunettes stylées avec -20% sur les montures enfant." },
 ];
 
 const relanceLentilles = [
@@ -168,7 +167,7 @@ const campagnesSaisonnieres = [
 ];
 
 type MessagesDict = Record<string, { title?: string; content: string }>;
-type SelectedMap = Record<string, boolean>;
+type SelectedMap  = Record<string, boolean>;
 
 export default function CampagnePage() {
   const navigation = useNavigation();
@@ -179,27 +178,28 @@ export default function CampagnePage() {
   const [selectedClients, setSelectedClients] = useState<SelectedMap>({});
   const [editMessageVisible, setEditMessageVisible] = useState(false);
   const [editedMessage, setEditedMessage] = useState('');
-  const [progressModalVisible, setProgressModalVisible] = useState(false);
+  const [activeFilter, setActiveFilter] = useState<'TOUS' | '6M' | '2A' | 'PLUS2A'>('TOUS');
+
+  // Progress modal (même UX qu’AddClientPage)
+  const [sending, setSending] = useState(false);
+  const [sendStep, setSendStep] = useState<'prep'|'send'|'done'|'error'>('prep');
+  const [sendError, setSendError] = useState<string | null>(null);
   const [progressCount, setProgressCount] = useState(0);
   const [progressTotal, setProgressTotal] = useState(0);
-  const [activeFilter, setActiveFilter] = useState<'TOUS' | '6M' | '2A' | 'PLUS2A'>('TOUS');
+  const [batchSummary, setBatchSummary] = useState<{sent:number; skipped:number; failed:number} | null>(null);
 
   useEffect(() => {
     const loadData = async () => {
       const msgData = await AsyncStorage.getItem('messages');
-      if (msgData) {
-        try { setMessages(JSON.parse(msgData)); } catch {}
-      }
+      if (msgData) { try { setMessages(JSON.parse(msgData)); } catch {} }
       const clientData = await AsyncStorage.getItem('clients');
-      if (clientData) {
-        try { setClients(JSON.parse(clientData)); } catch {}
-      }
+      if (clientData) { try { setClients(JSON.parse(clientData)); } catch {} }
     };
     loadData();
   }, []);
 
   const getMessageForClient = (template: string, client: Client) =>
-    template
+    (template || '')
       .replace('{prenom}', client.prenom || '')
       .replace('{nom}', client.nom || '')
       .replace(/\s*\{prenom\}\s*/g, '')
@@ -215,7 +215,7 @@ export default function CampagnePage() {
 
   const handlePreview = (id: string) => {
     const msg = getMessageById(id);
-    Alert.alert('Prévisualisation', msg.replace('{prenom}', 'Jean'));
+    Alert.alert('Prévisualisation', msg.replace('{prenom}', 'Jean').replace('{nom}', 'Dupont'));
   };
 
   const handleParametrage = (id: string) => {
@@ -252,10 +252,7 @@ export default function CampagnePage() {
     if (!dateStr) return true;
     const dateMessage = new Date(dateStr);
     if (isNaN(dateMessage.getTime())) return true;
-
-    const diffMois =
-      (now.getTime() - dateMessage.getTime()) / (1000 * 60 * 60 * 24 * 30.44);
-
+    const diffMois = (now.getTime() - dateMessage.getTime()) / (1000 * 60 * 60 * 24 * 30.44);
     switch (activeFilter) {
       case '6M':     return diffMois <= 6;
       case '2A':     return diffMois <= 24;
@@ -270,88 +267,81 @@ export default function CampagnePage() {
     const campagne = [...campagnes, ...relanceLentilles, ...campagnesSaisonnieres]
       .find((c) => c.id === selectedCampagneId);
 
-    const messageTemplate =
-      messages[selectedCampagneId]?.content || campagne?.messageParDefaut || '';
-
+    const messageTemplate = getMessageById(selectedCampagneId);
     const clientsCibles = filteredClients.filter((c) => selectedClients[getClientKey(c)]);
 
-    const licenceId = await getLicenceIdFromStorage();
-    if (!licenceId) {
-      Alert.alert('Erreur', 'Identifiant opticien (licenceId) introuvable.');
+    const { licenceId, cle } = await getLicenceFromStorage();
+    if (!licenceId && !cle) {
+      Alert.alert('Erreur', 'Licence introuvable.');
       return;
     }
 
     // Pré-check (optionnel)
-    let creditsActuels: number | null = null;
-    try {
-      creditsActuels = await fetchCreditsFromServer(licenceId);
-    } catch {}
-    if (creditsActuels !== null && creditsActuels < clientsCibles.length) {
-      Alert.alert(
-        'Crédits insuffisants',
-        `Il vous reste ${creditsActuels} crédits, mais ${clientsCibles.length} sont nécessaires.`
-      );
-      return;
+    if (licenceId) {
+      const creditsActuels = await fetchCreditsFromServer(licenceId);
+      if (creditsActuels !== null && creditsActuels < clientsCibles.length) {
+        Alert.alert('Crédits insuffisants',
+          `Il vous reste ${creditsActuels} crédits, mais ${clientsCibles.length} sont nécessaires.`);
+        return;
+      }
     }
 
-    const emetteur = await getSenderLabelFromSettings();
+    const emetteur  = await getSenderLabelFromSettings();
     const signature = await getSignatureFromSettings();
-    const isPromo = campagne?.type === 'promotionnelle';
+    const isPromo   = (campagne as any)?.type === 'promotionnelle';
 
+    // Modale progression (reset)
     setProgressCount(0);
     setProgressTotal(clientsCibles.length);
-    setProgressModalVisible(true);
+    setBatchSummary(null);
+    setSendError(null);
+    setSendStep('prep');
+    setSending(true);
 
-    let succes = 0;
+    let sent = 0, skipped = 0, failed = 0;
 
-    for (const client of clientsCibles) {
-      if (!client?.telephone) {
-        setProgressCount((p) => p + 1);
-        continue;
+    try {
+      setSendStep('send');
+
+      for (const client of clientsCibles) {
+        const phone = sanitizePhone(client.telephone || '');
+        if (!isPhone10(phone)) { skipped++; setProgressCount((p)=>p+1); continue; }
+
+        // Consentement : promo -> marketing, sinon -> service
+        const hasMarketing = !!(client as any)?.consentementMarketing || !!(client as any)?.consent?.marketing_sms?.value;
+        const hasService   = !!(client as any)?.consent?.service_sms?.value;
+
+        if ((isPromo && !hasMarketing) || (!isPromo && !hasService)) {
+          skipped++; setProgressCount((p)=>p+1); continue;
+        }
+
+        let messageFinal = getMessageForClient(messageTemplate, client);
+        messageFinal = appendSignature(messageFinal, signature);
+        if (isPromo) messageFinal = ensureStopClause(messageFinal);
+        if (!messageFinal) { failed++; setProgressCount((p)=>p+1); continue; }
+
+        try {
+          await sendSMS({ phoneNumber: phone, message: messageFinal, emetteur, licenceId, cle });
+          sent++;
+        } catch (e) {
+          console.warn(`Échec SMS à ${phone}:`, (e as Error).message);
+          failed++;
+        } finally {
+          setProgressCount((p)=>p+1);
+          await new Promise(r => setTimeout(r, 120)); // petite pause anti-burst
+        }
       }
-      if (isPromo && !client?.consentementMarketing) {
-        setProgressCount((p) => p + 1);
-        continue;
-      }
 
-      let messageFinal = getMessageForClient(messageTemplate, client);
-      // ajoute la signature
-      messageFinal = appendSignature(messageFinal, signature);
-      // pour les promos, assure que STOP est en dernier
-      if (isPromo && !/stop\s+au\s+36111/i.test(messageFinal)) {
-        messageFinal = `${messageFinal} STOP au 36111`;
-      }
+      if (sent > 0) { try { await consumeCredits(sent); } catch {} }
 
-      try {
-        await sendTransactionalOrPromoSMS({
-          phoneNumber: client.telephone,
-          message: messageFinal,
-          emetteur,
-          licenceId,
-        });
-        succes++;
-      } catch (e) {
-        console.warn(`Échec SMS à ${client.telephone}:`, (e as Error).message);
-      }
-
-      setProgressCount((p) => p + 1);
-      await new Promise((r) => setTimeout(r, 120));
+      setBatchSummary({ sent, skipped, failed });
+      setSendStep('done');
+      setTimeout(()=> setSending(false), 1000);
+      setModalVisible(false);
+    } catch (e:any) {
+      setSendError(e?.message || 'Erreur inconnue');
+      setSendStep('error');
     }
-
-    if (succes > 0) {
-      await consumeCredits(succes);
-    }
-
-    setProgressModalVisible(false);
-
-    let creditsRestants: number | null = null;
-    try { creditsRestants = await fetchCreditsFromServer(licenceId); } catch {}
-
-    Alert.alert(
-      'Envoi terminé',
-      `📤 ${succes} SMS envoyés sur ${clientsCibles.length}.${creditsRestants !== null ? `\nCrédits restants : ${creditsRestants}` : ''}`
-    );
-    setModalVisible(false);
   };
 
   const getClientKey = (c: Client) => String((c as any).id || c.telephone || '').trim();
@@ -362,7 +352,7 @@ export default function CampagnePage() {
 
       <View style={styles.annivBox}>
         <Text style={styles.subTitle}>🎂 Campagne Anniversaire</Text>
-        <Text style={styles.description}>SMS automatique à la date d'anniversaire du client.</Text>
+        <Text style={styles.description}>SMS automatique ou envoi immédiat.</Text>
         <TouchableOpacity style={styles.button} onPress={() => handlePreview('anniversaire')}>
           <Text style={styles.buttonText}>👁 Prévisualiser</Text>
         </TouchableOpacity>
@@ -376,7 +366,7 @@ export default function CampagnePage() {
 
       <View style={styles.annivBox}>
         <Text style={styles.subTitle}>🔁 Relance Lentilles</Text>
-        <Text style={styles.description}>Messages de relance personnalisés selon la durée de port.</Text>
+        <Text style={styles.description}>Relances selon la durée de port.</Text>
         {relanceLentilles.map((r) => (
           <View key={r.id} style={{ marginBottom: 12 }}>
             <Text style={{ color: '#fff', fontWeight: 'bold' }}>{r.titre}</Text>
@@ -397,7 +387,7 @@ export default function CampagnePage() {
 
       <View style={styles.annivBox}>
         <Text style={styles.subTitle}>📅 Campagnes saisonnières</Text>
-        <Text style={styles.description}>Messages ponctuels avec offres spéciales (modifiables).</Text>
+        <Text style={styles.description}>Offres spéciales (promo → STOP obligatoire géré automatiquement).</Text>
         {campagnesSaisonnieres.map((c) => (
           <View key={c.id} style={{ marginBottom: 12 }}>
             <Text style={{ color: '#fff', fontWeight: 'bold' }}>{c.titre}</Text>
@@ -439,7 +429,7 @@ export default function CampagnePage() {
                 if (def) setEditedMessage(def);
               }}
             >
-              <Text style={styles.buttonText}>♻️ Réinitialiser le message</Text>
+              <Text style={styles.buttonText}>♻️ Réinitialiser</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -453,7 +443,7 @@ export default function CampagnePage() {
       </TouchableOpacity>
 
       {/* Modal sélection clients */}
-      <Modal visible={modalVisible} transparent animationType="slide">
+      <Modal visible={modalVisible} transparent animationType="slide" onRequestClose={()=>setModalVisible(false)}>
         <View style={{ flex: 1, backgroundColor: '#000000dd', justifyContent: 'center', padding: 20 }}>
           <View style={{ backgroundColor: '#fff', padding: 20, borderRadius: 10, maxHeight: '90%' }}>
             <Text style={{ fontWeight: 'bold', fontSize: 16, marginBottom: 10 }}>
@@ -469,8 +459,7 @@ export default function CampagnePage() {
                     padding: 6,
                     borderRadius: 6,
                     backgroundColor: activeFilter === key ? '#007AFF' : '#ccc',
-                    flex: 1,
-                    alignItems: 'center',
+                    flex: 1, alignItems: 'center',
                   }}
                 >
                   <Text style={{ color: activeFilter === key ? '#fff' : '#000', fontSize: 12 }}>
@@ -508,16 +497,10 @@ export default function CampagnePage() {
                 return (
                   <TouchableOpacity
                     key={key}
-                    onPress={() =>
-                      setSelectedClients((prev) => ({ ...prev, [key]: !prev[key] }))
-                    }
+                    onPress={() => setSelectedClients((prev) => ({ ...prev, [key]: !prev[key] }))}
                     style={{
-                      paddingVertical: 6,
-                      borderBottomColor: '#ddd',
-                      borderBottomWidth: 1,
-                      flexDirection: 'row',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
+                      paddingVertical: 6, borderBottomColor: '#ddd', borderBottomWidth: 1,
+                      flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
                     }}
                   >
                     <Text style={{ fontSize: 14 }}>
@@ -543,24 +526,44 @@ export default function CampagnePage() {
         </View>
       </Modal>
 
-      {/* Progression */}
-      <Modal visible={progressModalVisible} transparent animationType="fade">
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.5)' }}>
-          <View style={{ backgroundColor: '#fff', padding: 20, borderRadius: 10, width: '80%' }}>
-            <Text style={{ fontSize: 18, fontWeight: 'bold', marginBottom: 10 }}>
-              Envoi des SMS en cours...
-            </Text>
-            <Text>{progressCount} / {progressTotal} envoyés</Text>
-            <View style={{ height: 10, backgroundColor: '#ddd', borderRadius: 5, marginVertical: 10, overflow: 'hidden' }}>
-              <View
-                style={{
-                  height: '100%',
-                  width: `${progressTotal ? (progressCount / progressTotal) * 100 : 0}%`,
-                  backgroundColor: '#4caf50',
-                  borderRadius: 5,
-                }}
-              />
+      {/* Modale de progression — même look qu’AddClientPage */}
+      <Modal
+        visible={sending}
+        transparent
+        animationType="fade"
+        onRequestClose={() => { if (sendStep !== 'send') setSending(false); }}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.progressCard}>
+            <Text style={styles.progressTitle}>Envoi des SMS…</Text>
+            {sendStep !== 'done' && sendStep !== 'error' && <ActivityIndicator size="large" color="#fff" />}
+            <View style={{ marginTop: 12, alignItems: 'center' }}>
+              <Text style={styles.progressLine}>{sendStep === 'prep' ? '• Préparation…' : '✓ Préparation'}</Text>
+              <Text style={styles.progressLine}>
+                {sendStep === 'send' ? '• Envoi au serveur…' : (sendStep === 'prep' ? '• Envoi au serveur' : '✓ Envoi au serveur')}
+              </Text>
+              <Text style={[styles.progressLine, { marginTop: 8 }]}>{progressCount} / {progressTotal}</Text>
+
+              {sendStep === 'done' && batchSummary && (
+                <View style={{ marginTop: 8 }}>
+                  <Text style={styles.progressOk}>✓ Terminé</Text>
+                  <Text style={styles.progressLine}>Envoyés : {batchSummary.sent}</Text>
+                  <Text style={styles.progressLine}>Ignorés (consentement/tél) : {batchSummary.skipped}</Text>
+                  <Text style={styles.progressLine}>Échecs : {batchSummary.failed}</Text>
+                </View>
+              )}
+
+              {sendStep === 'error' && <Text style={styles.progressErr}>✗ {sendError || 'Erreur inconnue'}</Text>}
             </View>
+
+            {sendStep === 'error' && (
+              <TouchableOpacity
+                style={[styles.modalActionBtn, { backgroundColor: '#ff3b30', marginTop: 12 }]}
+                onPress={() => setSending(false)}
+              >
+                <Text style={styles.modalActionText}>Fermer</Text>
+              </TouchableOpacity>
+            )}
           </View>
         </View>
       </Modal>
@@ -578,4 +581,14 @@ const styles = StyleSheet.create({
   button: { marginTop: 10, backgroundColor: '#007AFF', padding: 12, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
   smallButton: { flexGrow: 1, backgroundColor: '#333', padding: 10, borderRadius: 6, marginVertical: 4, alignItems: 'center' },
   buttonText: { color: '#fff', fontWeight: 'bold', fontSize: 14 },
+
+  // Progress modal
+  modalOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)' },
+  progressCard: { backgroundColor: '#222', padding: 22, borderRadius: 12, width: '80%', alignItems: 'center' },
+  progressTitle: { color: '#fff', fontWeight: '700', fontSize: 16, marginBottom: 10 },
+  progressLine: { color: '#ddd', marginTop: 2 },
+  progressOk: { color: '#3ddc84', marginTop: 6, fontWeight: '700' },
+  progressErr: { color: '#ff6b6b', marginTop: 6, fontWeight: '700' },
+  modalActionBtn: { paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8 },
+  modalActionText: { color: '#fff', fontWeight: '700' },
 });

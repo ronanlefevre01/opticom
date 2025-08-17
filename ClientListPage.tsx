@@ -8,6 +8,8 @@ import {
   Alert,
   TextInput,
   Modal,
+  ActivityIndicator,
+  Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native';
@@ -19,15 +21,23 @@ import API_BASE from './src/config/api';
 const SEND_SMS_ENDPOINT = `${API_BASE}/send-sms`;
 
 /* ===================== Helpers ===================== */
-const getLicenceIdFromStorage = async (): Promise<string | null> => {
+const sanitizePhone = (raw: string) => {
+  let p = (raw || '').replace(/[^\d+]/g, '');
+  if (p.startsWith('+33')) p = '0' + p.slice(3);
+  return p.replace(/\D/g, '');
+};
+const isPhone10 = (p: string) => /^\d{10}$/.test(p);
+
+const getLicenceFromStorage = async (): Promise<{ licenceId: string | null; cle: string | null }> => {
   try {
     const raw = await AsyncStorage.getItem('licence');
-    if (!raw) return null;
+    if (!raw) return { licenceId: null, cle: null };
     const lic = JSON.parse(raw);
-    const id = String(lic?.id || lic?.opticien?.id || '').trim();
-    return id || null;
+    const licenceId = String(lic?.id || lic?.opticien?.id || '').trim() || null;
+    const cle = String(lic?.licence || '').trim() || null;
+    return { licenceId, cle };
   } catch {
-    return null;
+    return { licenceId: null, cle: null };
   }
 };
 
@@ -105,10 +115,13 @@ export default function ClientListPage() {
     Record<string, string | { title?: string; content: string }>
   >({});
 
-  // progression
-  const [progressModalVisible, setProgressModalVisible] = useState(false);
+  // Modal progression (style AddClientPage)
+  const [sending, setSending] = useState(false);
+  const [sendStep, setSendStep] = useState<'prep'|'send'|'done'|'error'>('prep');
+  const [sendError, setSendError] = useState<string | null>(null);
   const [progressCount, setProgressCount] = useState(0);
   const [progressTotal, setProgressTotal] = useState(0);
+  const [batchSummary, setBatchSummary] = useState<{sent:number; skipped:number; failed:number} | null>(null);
 
   // “Personnalisé”
   const [customModalVisible, setCustomModalVisible] = useState(false);
@@ -135,9 +148,9 @@ export default function ClientListPage() {
     const lower = searchQuery.toLowerCase();
     let result = clients.filter(
       (client) =>
-        client.nom?.toLowerCase().includes(lower) ||
-        client.prenom?.toLowerCase().includes(lower) ||
-        client.telephone?.includes(lower)
+        (client.nom || '').toLowerCase().includes(lower) ||
+        (client.prenom || '').toLowerCase().includes(lower) ||
+        (client.telephone || '').includes(lower)
     );
     if (smsFilter !== 'Tous') {
       result = result.filter((client) =>
@@ -150,6 +163,54 @@ export default function ClientListPage() {
   const toggleSelect = (phone: string) => {
     setSelectedClients((prev) =>
       prev.includes(phone) ? prev.filter((p) => p !== phone) : [...prev, phone]
+    );
+  };
+
+  /* ---- Supprimer client (ligne) ---- */
+  const deleteClient = async (telephone: string) => {
+    Alert.alert(
+      'Supprimer ce client ?',
+      'Cette action est définitive.',
+      [
+        { text: 'Annuler', style: 'cancel' },
+        {
+          text: 'Supprimer',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const updated = clients.filter(c => c.telephone !== telephone);
+              setClients(updated);
+              setFilteredClients(updated);
+              setSelectedClients(prev => prev.filter(t => t !== telephone));
+              await AsyncStorage.setItem('clients', JSON.stringify(updated));
+            } catch {}
+          }
+        }
+      ]
+    );
+  };
+
+  /* ---- Supprimer la sélection ---- */
+  const deleteSelection = async () => {
+    if (selectedClients.length === 0) return;
+    Alert.alert(
+      'Supprimer la sélection ?',
+      `${selectedClients.length} client(s) seront supprimés.`,
+      [
+        { text: 'Annuler', style: 'cancel' },
+        {
+          text: 'Supprimer',
+          style: 'destructive',
+          onPress: async () => {
+            const setSel = new Set(selectedClients);
+            const updated = clients.filter(c => !setSel.has(c.telephone));
+            setClients(updated);
+            setFilteredClients(updated);
+            setSelectedClients([]);
+            await AsyncStorage.setItem('clients', JSON.stringify(updated));
+          }
+        }
+      ]
     );
   };
 
@@ -167,6 +228,7 @@ export default function ClientListPage() {
               client.telephone === telephone ? { ...client, messagesEnvoyes: [] } : client
             );
             setClients(updated);
+            setFilteredClients(updated);
             await AsyncStorage.setItem('clients', JSON.stringify(updated));
           },
         },
@@ -207,21 +269,26 @@ export default function ClientListPage() {
   /* --------- Appel serveur unitaire (transactionnel) --------- */
   const sendOne = async ({
     licenceId,
+    cle,
     phoneNumber,
     message,
   }: {
-    licenceId: string;
+    licenceId: string | null;
+    cle: string | null;
     phoneNumber: string;
     message: string;
   }) => {
-    const payload = { phoneNumber, message, licenceId };
+    const payload: any = { phoneNumber, message };
+    if (licenceId) payload.licenceId = licenceId;
+    if (cle) payload.cle = cle; // compat côté serveur
+
     const resp = await fetch(SEND_SMS_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     const data = await resp.json().catch(() => ({} as any));
-    if (!resp.ok || !data?.success) {
+    if (!resp.ok || (data?.success === false)) {
       const err =
         data?.error ||
         (resp.status === 403 ? 'Consentement/crédits/licence.' : "Échec de l’envoi.");
@@ -230,7 +297,7 @@ export default function ClientListPage() {
     return true;
   };
 
-  /* --------- Batch principal (toujours /send-sms) --------- */
+  /* --------- Batch principal --------- */
   const sendBatch = async (category: SMSCategory | '__custom__') => {
     const batch = clients.filter((c) => selectedClients.includes(c.telephone));
     if (batch.length === 0) {
@@ -238,79 +305,96 @@ export default function ClientListPage() {
       return;
     }
 
-    const licenceId = await getLicenceIdFromStorage();
-    if (!licenceId) {
-      Alert.alert('Erreur', 'Identifiant licence introuvable.');
+    const { licenceId, cle } = await getLicenceFromStorage();
+    if (!licenceId && !cle) {
+      Alert.alert('Erreur', 'Licence introuvable.');
       return;
     }
 
     // Pré-check crédits (facultatif)
-    const credits = await fetchCreditsFromServer(licenceId);
-    if (credits !== null && credits < batch.length) {
-      Alert.alert('Crédits insuffisants', `Crédits: ${credits}, SMS requis: ${batch.length}.`);
-      return;
+    if (licenceId) {
+      const credits = await fetchCreditsFromServer(licenceId);
+      if (credits !== null && credits < batch.length) {
+        Alert.alert('Crédits insuffisants', `Crédits: ${credits}, SMS requis: ${batch.length}.`);
+        return;
+      }
     }
 
     const signature = await getSignatureFromSettings();
 
-    const nowIso = new Date().toISOString();
-    setProgressModalVisible(true);
+    // Ouvre la modale “style AddClientPage”
+    setSending(true);
+    setSendError(null);
+    setSendStep('prep');
     setProgressTotal(batch.length);
     setProgressCount(0);
+    setBatchSummary(null);
 
+    const nowIso = new Date().toISOString();
     let sent = 0;
     let skippedConsent = 0;
     let failed = 0;
 
     const updated = [...clients];
 
-    for (const c of batch) {
-      const okService = !!c?.consent?.service_sms?.value;
-      if (!okService) { skippedConsent++; setProgressCount((x) => x + 1); continue; }
+    try {
+      setSendStep('send');
 
-      const tpl = category === '__custom__'
-        ? (customText || '')
-        : getTemplateString(category as SMSCategory);
-
-      let message = buildMessageForClient(tpl, c);
-      message = appendSignature(message, signature);
-      if (!message) { failed++; setProgressCount((x) => x + 1); continue; }
-
-      try {
-        await sendOne({ licenceId, phoneNumber: c.telephone, message });
-
-        // MAJ historique local
-        const idx = updated.findIndex((u) => u.telephone === c.telephone);
-        if (idx !== -1) {
-          const ref = updated[idx] as any;
-          if (!Array.isArray(ref.messagesEnvoyes)) ref.messagesEnvoyes = [];
-          ref.messagesEnvoyes.push({
-            type: category === '__custom__' ? ('Personnalisé' as SMSCategory) : (category as SMSCategory),
-            date: nowIso,
-          });
-          if (!ref.premierMessage) ref.premierMessage = nowIso;
+      for (const c of batch) {
+        // Sanity checks par client
+        const okService = !!c?.consent?.service_sms?.value;
+        const phone = sanitizePhone(c.telephone || '');
+        if (!okService || !isPhone10(phone)) {
+          skippedConsent++;
+          setProgressCount((x) => x + 1);
+          continue;
         }
 
-        sent++;
-      } catch (e) {
-        console.warn(`Échec SMS ${c.telephone}:`, (e as Error).message);
-        failed++;
-      } finally {
-        setProgressCount((x) => x + 1);
+        const tpl = category === '__custom__'
+          ? (customText || '')
+          : getTemplateString(category as SMSCategory);
+
+        let message = buildMessageForClient(tpl, c);
+        message = appendSignature(message, signature);
+        if (!message) { failed++; setProgressCount((x) => x + 1); continue; }
+
+        try {
+          await sendOne({ licenceId, cle, phoneNumber: phone, message });
+
+          // MAJ historique local
+          const idx = updated.findIndex((u) => u.telephone === c.telephone);
+          if (idx !== -1) {
+            const ref = updated[idx] as any;
+            if (!Array.isArray(ref.messagesEnvoyes)) ref.messagesEnvoyes = [];
+            ref.messagesEnvoyes.push({
+              type: category === '__custom__' ? ('Personnalisé' as SMSCategory) : (category as SMSCategory),
+              date: nowIso,
+            });
+            if (!ref.premierMessage) ref.premierMessage = nowIso;
+          }
+
+          sent++;
+        } catch (e) {
+          console.warn(`Échec SMS ${c.telephone}:`, (e as Error).message);
+          failed++;
+        } finally {
+          setProgressCount((x) => x + 1);
+        }
       }
+
+      await AsyncStorage.setItem('clients', JSON.stringify(updated));
+      setClients(updated);
+      setFilteredClients(updated);
+      setSelectedClients([]);
+
+      setBatchSummary({ sent, skipped: skippedConsent, failed });
+      setSendStep('done');
+      // on laisse la modale 1s pour que l’utilisateur voie “Terminé”
+      setTimeout(() => setSending(false), 1000);
+    } catch (e:any) {
+      setSendError(e?.message || 'Erreur inconnue');
+      setSendStep('error');
     }
-
-    await AsyncStorage.setItem('clients', JSON.stringify(updated));
-    setClients(updated);
-    setSelectedClients([]);
-    setProgressModalVisible(false);
-
-    const creditsAfter = await fetchCreditsFromServer(licenceId);
-    const details =
-      `Envoyés: ${sent}\nIgnorés (consentement): ${skippedConsent}\nÉchecs: ${failed}` +
-      (creditsAfter !== null ? `\nCrédits restants: ${creditsAfter}` : '');
-
-    Alert.alert('Envoi terminé', details);
   };
 
   /* --------- Render --------- */
@@ -323,17 +407,26 @@ export default function ClientListPage() {
             {item.prenom} {item.nom} ({item.telephone})
           </Text>
         </TouchableOpacity>
+
         <TouchableOpacity
           onPress={() => navigation.navigate('ClientDetails', { client: item })}
           style={styles.editButton}
         >
           <Text style={styles.editButtonText}>Modifier</Text>
         </TouchableOpacity>
+
         <TouchableOpacity
           onPress={() => resetClientHistory(item.telephone)}
           style={[styles.editButton, { marginLeft: 6 }]}
         >
           <Text style={styles.editButtonText}>Réinitialiser</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          onPress={() => deleteClient(item.telephone)}
+          style={[styles.deleteBtn, { marginLeft: 6 }]}
+        >
+          <Text style={styles.deleteBtnText}>Supprimer</Text>
         </TouchableOpacity>
       </View>
 
@@ -388,16 +481,30 @@ export default function ClientListPage() {
         ))}
       </View>
 
-      <FlatList data={filteredClients} keyExtractor={(item) => item.telephone} renderItem={renderItem} />
+      <FlatList
+        data={filteredClients}
+        keyExtractor={(item) => item.telephone}
+        renderItem={renderItem}
+      />
 
       {selectedClients.length > 0 && (
-        <TouchableOpacity style={styles.smsButton} onPress={openSmsDialog}>
-          <Text style={styles.smsText}>Envoyer SMS</Text>
-        </TouchableOpacity>
+        <View style={{ gap: 10, marginTop: 14 }}>
+          <TouchableOpacity style={styles.smsButton} onPress={openSmsDialog}>
+            <Text style={styles.smsText}>Envoyer SMS</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.deleteSelBtn} onPress={deleteSelection}>
+            <Text style={styles.deleteSelText}>🗑 Supprimer la sélection</Text>
+          </TouchableOpacity>
+        </View>
       )}
 
       {/* Modale "Personnalisé" */}
-      <Modal visible={customModalVisible} transparent animationType="fade" onRequestClose={() => setCustomModalVisible(false)}>
+      <Modal
+        visible={customModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setCustomModalVisible(false)}
+      >
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
             <Text style={styles.customTitle}>Message personnalisé</Text>
@@ -411,10 +518,16 @@ export default function ClientListPage() {
               onChangeText={setCustomText}
             />
             <View style={styles.customRow}>
-              <TouchableOpacity style={[styles.customBtn, { backgroundColor: '#28a745' }]} onPress={() => { setCustomModalVisible(false); setTimeout(() => sendBatch('__custom__'), 60); }}>
+              <TouchableOpacity
+                style={[styles.customBtn, { backgroundColor: '#28a745' }]}
+                onPress={() => { setCustomModalVisible(false); setTimeout(() => sendBatch('__custom__'), 60); }}
+              >
                 <Text style={styles.customBtnText}>Envoyer</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.customBtn, { backgroundColor: '#555' }]} onPress={() => setCustomModalVisible(false)}>
+              <TouchableOpacity
+                style={[styles.customBtn, { backgroundColor: '#555' }]}
+                onPress={() => setCustomModalVisible(false)}
+              >
                 <Text style={styles.customBtnText}>Fermer</Text>
               </TouchableOpacity>
             </View>
@@ -422,26 +535,50 @@ export default function ClientListPage() {
         </View>
       </Modal>
 
-      {/* Modale de progression */}
-      <Modal visible={progressModalVisible} transparent animationType="fade">
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#00000088' }}>
-          <View style={{ width: '80%', padding: 20, backgroundColor: 'white', borderRadius: 10 }}>
-            <Text style={{ fontWeight: 'bold', fontSize: 16, marginBottom: 10 }}>
-              Envoi des SMS...
-            </Text>
-            <Text>
-              {progressCount} / {progressTotal} envoyés
-            </Text>
-            <View style={{ height: 10, backgroundColor: '#eee', marginTop: 10, borderRadius: 5 }}>
-              <View
-                style={{
-                  width: `${progressTotal ? (progressCount / progressTotal) * 100 : 0}%`,
-                  height: '100%',
-                  backgroundColor: '#4CAF50',
-                  borderRadius: 5,
-                }}
-              />
+      {/* Modale de progression — même look & feel qu’AddClientPage */}
+      <Modal
+        visible={sending}
+        transparent
+        animationType="fade"
+        onRequestClose={() => { if (sendStep !== 'send') setSending(false); }}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.progressCard}>
+            <Text style={styles.progressTitle}>Envoi des SMS…</Text>
+            {sendStep !== 'done' && sendStep !== 'error' && <ActivityIndicator size="large" color="#fff" />}
+
+            <View style={{ marginTop: 12, alignItems: 'center' }}>
+              <Text style={styles.progressLine}>
+                {sendStep === 'prep' ? '• Préparation…' : '✓ Préparation'}
+              </Text>
+              <Text style={styles.progressLine}>
+                {sendStep === 'send' ? '• Envoi au serveur…' : (sendStep === 'prep' ? '• Envoi au serveur' : '✓ Envoi au serveur')}
+              </Text>
+
+              <Text style={[styles.progressLine, { marginTop: 8 }]}>
+                {progressCount} / {progressTotal}
+              </Text>
+
+              {sendStep === 'done' && batchSummary && (
+                <View style={{ marginTop: 8 }}>
+                  <Text style={styles.progressOk}>✓ Terminé</Text>
+                  <Text style={styles.progressLine}>Envoyés : {batchSummary.sent}</Text>
+                  <Text style={styles.progressLine}>Ignorés (consentement/tél) : {batchSummary.skipped}</Text>
+                  <Text style={styles.progressLine}>Échecs : {batchSummary.failed}</Text>
+                </View>
+              )}
+
+              {sendStep === 'error' && <Text style={styles.progressErr}>✗ {sendError || 'Erreur inconnue'}</Text>}
             </View>
+
+            {sendStep === 'error' && (
+              <TouchableOpacity
+                style={[styles.modalActionBtn, { backgroundColor: '#ff3b30', marginTop: 12 }]}
+                onPress={() => setSending(false)}
+              >
+                <Text style={styles.modalActionText}>Fermer</Text>
+              </TouchableOpacity>
+            )}
           </View>
         </View>
       </Modal>
@@ -485,10 +622,14 @@ const styles = StyleSheet.create({
   clientText: { fontSize: 16, color: '#fff' },
   editButton: { marginLeft: 6, padding: 6, backgroundColor: '#1a1a1a', borderRadius: 4 },
   editButtonText: { fontSize: 14, color: '#00BFFF' },
+  deleteBtn: { padding: 6, backgroundColor: '#3b0d0d', borderRadius: 4 },
+  deleteBtnText: { fontSize: 14, color: '#ff6b6b', fontWeight: '700' },
   smsHistory: { marginTop: 4, paddingLeft: 10 },
   smsHistoryText: { fontSize: 13, color: '#aaa' },
-  smsButton: { marginTop: 20, backgroundColor: '#00BFFF', padding: 14, borderRadius: 10, alignItems: 'center' },
+  smsButton: { backgroundColor: '#00BFFF', padding: 14, borderRadius: 10, alignItems: 'center' },
   smsText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
+  deleteSelBtn: { backgroundColor: '#3b0d0d', padding: 12, borderRadius: 10, alignItems: 'center' },
+  deleteSelText: { color: '#ff6b6b', fontWeight: 'bold' },
 
   // Custom modal
   customOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)' },
@@ -507,4 +648,14 @@ const styles = StyleSheet.create({
   customRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 12, gap: 10 },
   customBtn: { flex: 1, paddingVertical: 10, borderRadius: 8, alignItems: 'center' },
   customBtnText: { color: '#fff', fontWeight: '700' },
+
+  // Progress modal (match AddClientPage)
+  modalOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)' },
+  progressCard: { backgroundColor: '#222', padding: 22, borderRadius: 12, width: '80%', alignItems: 'center' },
+  progressTitle: { color: '#fff', fontWeight: '700', fontSize: 16, marginBottom: 10 },
+  progressLine: { color: '#ddd', marginTop: 2 },
+  progressOk: { color: '#3ddc84', marginTop: 6, fontWeight: '700' },
+  progressErr: { color: '#ff6b6b', marginTop: 6, fontWeight: '700' },
+  modalActionBtn: { paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8 },
+  modalActionText: { color: '#fff', fontWeight: '700' },
 });
