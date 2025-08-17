@@ -1,9 +1,9 @@
-// SettingsPage.tsx — PATCH API "cle"
+// SettingsPage.tsx — API unifiée "cle" + compat pour CGV/prefs
 // - GET  /api/licence?cle=...
 // - PUT  /api/licence/expediteur { cle, expediteur }
 // - PUT  /api/licence/signature  { cle, signature }
-// - GET  /api/licence/prefs?cle=...
-// - POST /api/licence/prefs      { cle, ... }
+// - GET  /api/licence/prefs?cle=...&licenceId=...
+// - POST /api/licence/prefs      { cle, licenceId, ... }
 
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import {
@@ -20,10 +20,20 @@ const SERVER_BASE = 'https://opticom-sms-server.onrender.com';
 const MENTIONS_URL = `${SERVER_BASE}/legal/mentions.md`;
 const PRIVACY_URL  = `${SERVER_BASE}/legal/privacy.md`;
 const CGV_LATEST_URL = `${SERVER_BASE}/legal/cgv-2025-08-14.md`;
-const CGV_STATUS = (cle: string) =>
-  `${SERVER_BASE}/licence/cgv-status?cle=${encodeURIComponent(cle)}`;
-const LICENCE_PREFS_GET = (cle: string) =>
-  `${SERVER_BASE}/api/licence/prefs?cle=${encodeURIComponent(cle)}`;
+
+// Compat: certains endpoints acceptent `cle`, d'autres `id`/`licenceId`
+const CGV_STATUS = (cle?: string, id?: string) => {
+  const sp = new URLSearchParams();
+  if (cle) sp.set('cle', cle);
+  if (id)  { sp.set('id', id); sp.set('licenceId', id); }
+  return `${SERVER_BASE}/licence/cgv-status?${sp.toString()}`;
+};
+const LICENCE_PREFS_GET = (cle?: string, id?: string) => {
+  const sp = new URLSearchParams();
+  if (cle) sp.set('cle', cle);
+  if (id)  sp.set('licenceId', id);
+  return `${SERVER_BASE}/api/licence/prefs?${sp.toString()}`;
+};
 const LICENCE_PREFS_POST = `${SERVER_BASE}/api/licence/prefs`;
 
 type CustomMessage = { title: string; content: string };
@@ -57,7 +67,6 @@ async function getJSON(url: string) {
   if (!r.ok) throw new Error(`HTTP ${r.status}: ${t}`);
   return t ? JSON.parse(t) : {};
 }
-
 async function putJSON(path: string, body: any) {
   const r = await fetch(`${SERVER_BASE}${path}`, {
     method: 'PUT',
@@ -153,13 +162,16 @@ export default function SettingsPage() {
     loadData();
   }, []);
 
-  // --- CGV depuis le serveur (clé licence requise) ---
+  // IDs (réévalués à chaque render)
+  const cleLicence = String(licence?.licence || '').trim();
+  const licenceId = String(licence?.id || licence?.opticien?.id || '').trim();
+
+  // --- CGV depuis le serveur (clé/id requis selon handler) ---
   useEffect(() => {
-    const loadCgv = async () => {
-      const cle = String(licence?.licence || '').trim();
-      if (!cle) { setCgvInfo(null); return; }
+    if (!cleLicence && !licenceId) { setCgvInfo(null); return; }
+    (async () => {
       try {
-        const r = await fetch(CGV_STATUS(cle));
+        const r = await fetch(CGV_STATUS(cleLicence, licenceId));
         const j = await r.json();
         if (r.ok) {
           setCgvInfo({
@@ -174,51 +186,36 @@ export default function SettingsPage() {
       } catch {
         setCgvInfo(null);
       }
-    };
-    loadCgv();
-  }, [licence?.licence]);
+    })();
+  }, [cleLicence, licenceId]);
 
   // --- Prefs automations (serveur) ---
   useEffect(() => {
-    const loadPrefs = async () => {
-      const cle = String(licence?.licence || '').trim();
-      if (!cle) return;
+    if (!cleLicence && !licenceId) return;
 
+    const loadPrefs = async () => {
       setLoadingPrefs(true);
       try {
-        const r = await fetch(LICENCE_PREFS_GET(cle));
+        const r = await fetch(LICENCE_PREFS_GET(cleLicence, licenceId));
         const j = await r.json();
-        if (r.ok) {
-          setAutoBirthday(!!j.autoBirthdayEnabled);
-          setAutoLensRenewal(!!j.autoLensRenewalEnabled);
-          setAutoBirthdayMessage(String(j.messageBirthday || 'Joyeux anniversaire {prenom} !'));
-          setAutoLensMessage(String(j.messageLensRenewal || 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.'));
-          const lad = Number.isFinite(+j.lensAdvanceDays) ? Math.max(0, Math.min(60, +j.lensAdvanceDays)) : 10;
-          setLensAdvanceDays(lad);
+        if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
 
-          await AsyncStorage.multiSet([
-            ['autoBirthdayEnabled', j.autoBirthdayEnabled ? '1' : '0'],
-            ['autoLensRenewalEnabled', j.autoLensRenewalEnabled ? '1' : '0'],
-            ['autoBirthdayMessage', String(j.messageBirthday || '')],
-            ['autoLensMessage', String(j.messageLensRenewal || '')],
-            ['lensAdvanceDays', String(lad)],
-          ]);
-        } else {
-          // fallback local
-          const [b, l, mb, ml, lad] = await Promise.all([
-            AsyncStorage.getItem('autoBirthdayEnabled'),
-            AsyncStorage.getItem('autoLensRenewalEnabled'),
-            AsyncStorage.getItem('autoBirthdayMessage'),
-            AsyncStorage.getItem('autoLensMessage'),
-            AsyncStorage.getItem('lensAdvanceDays'),
-          ]);
-          setAutoBirthday(b === '1');
-          setAutoLensRenewal(l === '1');
-          if (mb) setAutoBirthdayMessage(mb);
-          if (ml) setAutoLensMessage(ml);
-          setLensAdvanceDays(Number.isFinite(+lad!) ? Math.max(0, Math.min(60, +lad!)) : 10);
-        }
+        setAutoBirthday(!!j.autoBirthdayEnabled);
+        setAutoLensRenewal(!!j.autoLensRenewalEnabled);
+        setAutoBirthdayMessage(String(j.messageBirthday || 'Joyeux anniversaire {prenom} !'));
+        setAutoLensMessage(String(j.messageLensRenewal || 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.'));
+        const lad = Number.isFinite(+j.lensAdvanceDays) ? Math.max(0, Math.min(60, +j.lensAdvanceDays)) : 10;
+        setLensAdvanceDays(lad);
+
+        await AsyncStorage.multiSet([
+          ['autoBirthdayEnabled', j.autoBirthdayEnabled ? '1' : '0'],
+          ['autoLensRenewalEnabled', j.autoLensRenewalEnabled ? '1' : '0'],
+          ['autoBirthdayMessage', String(j.messageBirthday || '')],
+          ['autoLensMessage', String(j.messageLensRenewal || '')],
+          ['lensAdvanceDays', String(lad)],
+        ]);
       } catch {
+        // fallback local
         const [b, l, mb, ml, lad] = await Promise.all([
           AsyncStorage.getItem('autoBirthdayEnabled'),
           AsyncStorage.getItem('autoLensRenewalEnabled'),
@@ -237,45 +234,41 @@ export default function SettingsPage() {
     };
 
     loadPrefs();
-  }, [licence?.licence]);
+  }, [cleLicence, licenceId]);
 
-  // --- Sauvegardes côté serveur (utilisent cle) ---
+  // --- Sauvegardes côté serveur (utilisent cle; id toléré, ignoré sinon) ---
   const saveSenderRemote = useCallback(
     async (normalized: string) => {
-      const cle = String(licence?.licence || '').trim();
-      if (!cle) return false;
+      if (!cleLicence) return false;
       try {
-        const data = await putJSON(`/api/licence/expediteur`, { cle, expediteur: normalized });
+        const data = await putJSON(`/api/licence/expediteur`, { cle: cleLicence, expediteur: normalized, licenceId });
         if ((data?.ok ?? true) && data?.licence) {
           setLicence(data.licence);
           try { await AsyncStorage.setItem('licence', JSON.stringify(data.licence)); } catch {}
-          return true;
-        }
-        return true; // si 200 sans payload ok
-      } catch {
-        return false;
-      }
-    },
-    [licence]
-  );
-
-  const saveSignatureRemote = useCallback(
-    async (sig: string) => {
-      const cle = String(licence?.licence || '').trim();
-      if (!cle) return false;
-      try {
-        const data = await putJSON(`/api/licence/signature`, { cle, signature: sig });
-        if ((data?.ok ?? true) && data?.licence) {
-          setLicence(data.licence);
-          try { await AsyncStorage.setItem('licence', JSON.stringify(data.licence)); } catch {}
-          return true;
         }
         return true;
       } catch {
         return false;
       }
     },
-    [licence]
+    [cleLicence, licenceId]
+  );
+
+  const saveSignatureRemote = useCallback(
+    async (sig: string) => {
+      if (!cleLicence) return false;
+      try {
+        const data = await putJSON(`/api/licence/signature`, { cle: cleLicence, signature: sig, licenceId });
+        if ((data?.ok ?? true) && data?.licence) {
+          setLicence(data.licence);
+          try { await AsyncStorage.setItem('licence', JSON.stringify(data.licence)); } catch {}
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [cleLicence, licenceId]
   );
 
   const handleSaveBasics = async () => {
@@ -311,8 +304,7 @@ export default function SettingsPage() {
 
   const handleSaveAutomations = async () => {
     try {
-      const cle = String(licence?.licence || '').trim();
-      if (!cle) {
+      if (!cleLicence) {
         Alert.alert('Licence', 'Veuillez vous connecter à une licence avant de sauvegarder.');
         return;
       }
@@ -323,7 +315,8 @@ export default function SettingsPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          cle,
+          cle: cleLicence,
+          licenceId, // compat serveur
           autoBirthdayEnabled: autoBirthday,
           autoLensRenewalEnabled: autoLensRenewal,
           lensAdvanceDays: lad,
@@ -401,9 +394,6 @@ export default function SettingsPage() {
       </View>
     );
   }
-
-  const licenceId = String(licence?.id || licence?.opticien?.id || '').trim();
-  const cleLicence = String(licence?.licence || '').trim();
 
   return (
     <ScrollView

@@ -1,4 +1,5 @@
 // App.tsx
+import "./src/compat/patchApi"; // doit être importé avant tout le reste
 import 'react-native-gesture-handler';
 import React, { useEffect, useMemo, useState } from 'react';
 import { View, ActivityIndicator } from 'react-native';
