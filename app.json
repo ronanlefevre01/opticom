@@ -1,19 +1,28 @@
 {
   "expo": {
     "name": "OptiCOM",
-    "slug": "OptiCOM",
+    "slug": "opticom",
+    "scheme": "opticom",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
+    "platforms": ["ios", "android", "web"],
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.ovedistribution.opticom",
+      "buildNumber": "2",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSCameraUsageDescription": "Permet de scanner des documents/étiquettes pour les fiches atelier.",
+        "NSPhotoLibraryAddUsageDescription": "Permet d’enregistrer des images ou PDF générés par l’application."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -23,7 +32,22 @@
       "edgeToEdgeEnabled": true
     },
     "web": {
-      "favicon": "./assets/favicon.png"
-    }
+      "bundler": "metro",
+      "favicon": "./assets/favicon.png",
+      "name": "OptiCOM",
+      "shortName": "OptiCOM",
+      "display": "standalone",
+      "themeColor": "#0a84ff",
+      "backgroundColor": "#000000",
+      "meta": {
+        "viewport": "width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover",
+        "apple": { "webAppCapable": true, "statusBarStyle": "default" }
+      }
+    },
+    "assetBundlePatterns": ["**/*"],
+    "extra": {
+      "eas": { "projectId": "19127098-ffe2-4065-818b-673b40026c5b" }
+    },
+    "owner": "ronanlefevre01"
   }
 }
