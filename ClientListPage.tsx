@@ -21,7 +21,39 @@ const sanitizePhone = (raw: string) => {
   if (p.startsWith('+33')) p = '0' + p.slice(3);
   return p.replace(/\D/g, '');
 };
+const toE164FR = (p10: string) => (p10 && p10.startsWith('0') ? `+33${p10.slice(1)}` : p10);
 const isPhone10 = (p: string) => /^\d{10}$/.test(p);
+
+// FIX: clés AsyncStorage pour tombstones (clients supprimés) et resets d’historique
+const KEY_CLIENT_TOMBSTONES = 'clients.tombstones';
+const KEY_SMS_HISTORY_RESETS = 'smsHistory.resets';
+
+async function loadTombstones(): Promise<string[]> {
+  try {
+    const raw = await AsyncStorage.getItem(KEY_CLIENT_TOMBSTONES);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+}
+async function saveTombstones(list: string[]) {
+  try { await AsyncStorage.setItem(KEY_CLIENT_TOMBSTONES, JSON.stringify(Array.from(new Set(list)))); } catch {}
+}
+async function addTombstone(phoneKey: string) {
+  const list = await loadTombstones();
+  if (!list.includes(phoneKey)) { list.push(phoneKey); await saveTombstones(list); }
+}
+
+type ResetMap = Record<string, string>; // phone -> ISO date
+async function loadHistoryResets(): Promise<ResetMap> {
+  try {
+    const raw = await AsyncStorage.getItem(KEY_SMS_HISTORY_RESETS);
+    const obj = raw ? JSON.parse(raw) : {};
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch { return {}; }
+}
+async function saveHistoryResets(map: ResetMap) {
+  try { await AsyncStorage.setItem(KEY_SMS_HISTORY_RESETS, JSON.stringify(map)); } catch {}
+}
 
 const getLicenceFromStorage = async (): Promise<{ licenceId: string | null; cle: string | null }> => {
   try {
@@ -43,10 +75,10 @@ const resolveLicenceId = async (): Promise<string | null> => {
   if (!cle) return null;
 
   const candidates = [
-    `${API_BASE}/api/licence/by-key?key=${encodeURIComponent(cle)}`,
-    `${API_BASE}/licence/by-key?key=${encodeURIComponent(cle)}`,
-    `${API_BASE}/licence?key=${encodeURIComponent(cle)}`,
     `${API_BASE}/api/licence?cle=${encodeURIComponent(cle)}`,
+    `${API_BASE}/licence?cle=${encodeURIComponent(cle)}`,
+    `${API_BASE}/api/licence/by-key?cle=${encodeURIComponent(cle)}`,
+    `${API_BASE}/licence/by-key?cle=${encodeURIComponent(cle)}`,
   ];
   for (const url of candidates) {
     try {
@@ -119,7 +151,7 @@ const fetchCreditsFromServer = async (licenceId: string): Promise<number | null>
       if (typeof credits === 'number') return credits;
     } catch {}
   }
-  // anciens fallbacks (au cas où)
+  // fallbacks éventuels
   const fallbacks = [
     `${API_BASE}/licence/credits?licenceId=${encodeURIComponent(licenceId)}`,
     `${API_BASE}/licence-credits?licenceId=${encodeURIComponent(licenceId)}`,
@@ -325,6 +357,10 @@ export default function ClientListPage() {
         return;
       }
 
+      // 0) Charger tombstones et resets (local)
+      const [tombstones, resets] = await Promise.all([loadTombstones(), loadHistoryResets()]);
+      const tombstoneSet = new Set(tombstones);
+
       // 1) Clients
       const remote = await fetchClientsFromServer(licenceId);
       if (!remote) {
@@ -332,20 +368,24 @@ export default function ClientListPage() {
         return;
       }
 
+      // 1bis) Appliquer tombstones locaux (anti-résurrection)
+      const remoteFiltered = remote.filter(c => !tombstoneSet.has(sanitizePhone(c.telephone)));
+
       // 2) Historique via { licence }.historiqueSms
       const licenceHistory = await fetchSmsHistoryFromLicence(licenceId, cle);
 
-      // 3) Indexer l’historique par téléphone
+      // 3) Indexer l’historique par téléphone (et ignorer ceux reset localement)
       const byPhone = new Map<string, { date: string; type: string }[]>();
       for (const h of licenceHistory) {
         const key = sanitizePhone(h.numero || '');
         if (!key) continue;
+        if (resets[key]) continue; // FIX: l’historique a été réinitialisé localement → on ignore ce numéro
         if (!byPhone.has(key)) byPhone.set(key, []);
         byPhone.get(key)!.push({ date: h.date, type: labelFromType(h.type) });
       }
 
-      // 4) Injecter l’historique serveur dans les clients
-      const remoteWithHistory = (remote || []).map(c => {
+      // 4) Injecter l’historique serveur (filtré par resets) dans les clients
+      const remoteWithHistory = (remoteFiltered || []).map(c => {
         const key = sanitizePhone(c.telephone);
         const logs = byPhone.get(key) || [];
         const prev = Array.isArray(c.messagesEnvoyes) ? c.messagesEnvoyes : [];
@@ -361,7 +401,8 @@ export default function ClientListPage() {
       // 5) Merger avec le local
       const localStr = await AsyncStorage.getItem('clients');
       const local: Client[] = localStr ? JSON.parse(localStr) : [];
-      const merged = mergeLocalWithServer(local, remoteWithHistory);
+      const merged = mergeLocalWithServer(local, remoteWithHistory)
+        .filter(c => !tombstoneSet.has(sanitizePhone(c.telephone))); // sécurité
 
       await AsyncStorage.setItem('clients', JSON.stringify(merged));
       setClients(merged);
@@ -417,21 +458,54 @@ export default function ClientListPage() {
     );
   };
 
-  /* ---- Supprimer client (ligne) ---- */
+  // FIX: suppression côté serveur (DELETE), avec tombstone local si échec
   const deleteClient = async (rawPhone: string) => {
     const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est définitive.');
     if (!ok) return;
+
     const phone = sanitizePhone(rawPhone);
+    const target = clients.find(c => sanitizePhone(c.telephone) === phone);
+    const targetId = target?.id;
+
+    // Optimiste local
     const updated = clients.filter(c => sanitizePhone(c.telephone) !== phone);
     setClients(updated);
     setFilteredClients(updated);
     setSelectedClients(prev => prev.filter(t => t !== phone));
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
+
+    // Serveur
+    try {
+      const licId = (await resolveLicenceId()) || (await getLicenceFromStorage()).licenceId;
+      if (!licId) throw new Error('LICENCE_ID_MISSING');
+
+      if (targetId) {
+        const del = await fetch(`${API_BASE}/api/clients/${encodeURIComponent(String(targetId))}?licenceId=${encodeURIComponent(licId)}`, {
+          method: 'DELETE',
+        });
+        if (!del.ok) throw new Error(`HTTP ${del.status}`);
+      } else {
+        // pas d’ID serveur : pousse une tombstone via upsert
+        await fetch(`${API_BASE}/api/clients/upsert`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            licenceId: licId,
+            clients: [{ id: `loc-${phone}`, phone, telephone: phone, updatedAt: new Date().toISOString(), deletedAt: new Date().toISOString() }],
+          }),
+        });
+      }
+    } catch {
+      // garde un tombstone local pour éviter la résurrection aux prochains syncs
+      await addTombstone(phone);
+    }
   };
 
+  // FIX: reset historique — tente serveur, sinon marqueur local (resets)
   const resetClientHistory = async (rawPhone: string) => {
     const ok = await confirmAsync('Réinitialiser l’historique ?', 'Effacer l’historique des SMS de ce client ?', 'Réinitialiser');
     if (!ok) return;
+
     const phone = sanitizePhone(rawPhone);
     const updated = clients.map((client) =>
       sanitizePhone(client.telephone) === phone ? { ...client, messagesEnvoyes: [] } : client
@@ -439,6 +513,34 @@ export default function ClientListPage() {
     setClients(updated);
     setFilteredClients(updated);
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
+
+    // Marqueur local pour bloquer la réapparition via sync
+    const resets = await loadHistoryResets();
+    resets[phone] = new Date().toISOString();
+    await saveHistoryResets(resets);
+
+    // Tentatives côté serveur (on supporte plusieurs endpoints possibles)
+    try {
+      const licId = (await resolveLicenceId()) || (await getLicenceFromStorage()).licenceId;
+      if (!licId) throw new Error('LICENCE_ID_MISSING');
+      const numero = toE164FR(phone);
+
+      const tries = [
+        { url: `${API_BASE}/api/sms-history/erase`, method: 'POST', body: { licenceId: licId, numero } },
+        { url: `${API_BASE}/api/sms-history/erase-for-number`, method: 'POST', body: { licenceId: licId, numero } },
+        { url: `${API_BASE}/api/licence/history/erase`, method: 'POST', body: { licenceId: licId, numero } },
+      ];
+      let okSrv = false;
+      for (const t of tries) {
+        try {
+          const r = await fetch(t.url, { method: t.method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(t.body) });
+          if (r.ok) { okSrv = true; break; }
+        } catch {}
+      }
+      if (!okSrv) {
+        // pas grave — le reset local empêchera le retour
+      }
+    } catch {}
   };
 
   const getTemplateString = (key: SMSCategory) => {

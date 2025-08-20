@@ -25,12 +25,15 @@ const PRIVACY_URL  = `${SERVER_BASE}/legal/privacy.md`;
 const CGV_LATEST_URL = `${SERVER_BASE}/legal/cgv-2025-08-14.md`;
 
 // --- API builders ---
-const LICENCE_GET = (cle?: string, id?: string) => {
+
+const LICENCE_GET = (cle?: string, id?: string, bust?: number) => {
   const sp = new URLSearchParams();
   if (cle) sp.set('cle', cle);
-  if (id)  sp.set('id', id);                 // <-- le serveur attend "id" (pas "licenceId") ici
+  if (id)  sp.set('id', id);
+  if (bust) sp.set('_', String(bust)); // <- anti-cache
   return `${SERVER_BASE}/api/licence?${sp.toString()}`;
 };
+
 
 const CGV_STATUS = (cle?: string, id?: string) => {
   const sp = new URLSearchParams();
@@ -204,7 +207,9 @@ export default function SettingsPage() {
 
       // 1) Licence: alias + signature
       try {
-        const licResp = await getJSON(LICENCE_GET(cleLicence, licenceId));
+      
+        const licResp = await getJSON(LICENCE_GET(cleLicence, licenceId, Date.now()));
+
         const newLicence = licResp?.licence ?? licResp;
         if (newLicence) {
           setLicence(newLicence);
@@ -321,36 +326,69 @@ export default function SettingsPage() {
   );
 
   const handleSaveBasics = async () => {
-    try {
-      const normalized = normalizeSender(expediteurRaw);
-      if (normalized.length < 3) {
-        Alert.alert('Expéditeur', 'Doit contenir 3 à 11 caractères alphanumériques.');
-        return;
-      }
-      await AsyncStorage.setItem('signature', signature);
-      if (licence) {
-        const updated = { ...licence, libelleExpediteur: normalized, signature };
-        await AsyncStorage.setItem('licence', JSON.stringify(updated));
-        setLicence(updated);
-      }
-      setExpediteurRaw(normalized);
-
-      const [okSender, okSig] = await Promise.all([
-        saveSenderRemote(normalized),
-        saveSignatureRemote(signature),
-      ]);
-
-      if (okSender || okSig) {
-        Alert.alert('Paramètres', 'Enregistrés avec succès.');
-        // relit la licence côté serveur pour refléter la normalisation
-        await syncFromServer();
-      } else {
-        Alert.alert('Paramètres', 'Enregistré localement. (Serveur indisponible)');
-      }
-    } catch {
-      Alert.alert('Erreur', 'Impossible de sauvegarder les paramètres.');
+  try {
+    const normalized = normalizeSender(expediteurRaw);
+    if (normalized.length < 3) {
+      Alert.alert('Expéditeur', 'Doit contenir 3 à 11 caractères alphanumériques.');
+      return;
     }
-  };
+
+    // 1) Met à jour local immédiatement
+    await AsyncStorage.setItem('signature', signature);
+    if (licence) {
+      const updated = { ...licence, libelleExpediteur: normalized, signature };
+      setLicence(updated);
+      await AsyncStorage.setItem('licence', JSON.stringify(updated));
+    }
+    setExpediteurRaw(normalized);
+
+    // 2) Push serveur (concurrent)
+    const [okSender, okSig] = await Promise.all([
+      saveSenderRemote(normalized),
+      saveSignatureRemote(signature),
+    ]);
+
+    if (okSender || okSig) {
+      // 3) Refetch FRAIS avec cache-buster pour éviter le stale
+      try {
+        const sp = new URLSearchParams();
+        if (cleLicence) sp.set('cle', cleLicence);
+        if (licenceId)  sp.set('id', licenceId);
+        sp.set('_', String(Date.now())); // <- anti-cache
+        const url = `${SERVER_BASE}/api/licence?${sp.toString()}`;
+
+        const resp = await fetch(url, { headers: { Accept: 'application/json' } });
+        const txt = await resp.text();
+        if (resp.ok && txt) {
+          const data = JSON.parse(txt);
+          const fresh = data?.licence ?? data;
+          if (fresh) {
+            setLicence(fresh);
+            await AsyncStorage.setItem('licence', JSON.stringify(fresh));
+
+            const sender =
+              fresh.libelleExpediteur || fresh.opticien?.enseigne || fresh.nom || 'OptiCOM';
+            setExpediteurRaw(String(sender));
+
+            if (typeof fresh.signature === 'string') {
+              setSignature(fresh.signature);
+              await AsyncStorage.setItem('signature', fresh.signature);
+            }
+          }
+        }
+      } catch {
+        // si le refetch échoue, on garde l'état local déjà mis à jour
+      }
+
+      Alert.alert('Paramètres', 'Enregistrés avec succès.');
+    } else {
+      Alert.alert('Paramètres', 'Enregistré localement. (Serveur indisponible)');
+    }
+  } catch {
+    Alert.alert('Erreur', 'Impossible de sauvegarder les paramètres.');
+  }
+};
+
 
   // ------ Automatisations ------
   const handleSaveAutomations = async () => {
