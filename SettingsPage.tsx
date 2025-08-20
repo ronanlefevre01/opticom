@@ -1,9 +1,9 @@
 // SettingsPage.tsx — API unifiée "cle" + compat pour CGV/prefs
-// - GET  /api/licence?cle=...
-// - PUT  /api/licence/expediteur { cle, expediteur }
-// - PUT  /api/licence/signature  { cle, signature }
+// - GET  /api/licence?cle=...&licenceId=...
+// - PUT  /api/licence/expediteur { cle, expediteur, licenceId? }
+// - PUT  /api/licence/signature  { cle, signature,  licenceId? }
 // - GET  /api/licence/prefs?cle=...&licenceId=...
-// - POST /api/licence/prefs      { cle, licenceId, ... }
+// - POST /api/licence/prefs      { cle, licenceId, ... , customMessages? }
 
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import {
@@ -20,6 +20,13 @@ const SERVER_BASE = 'https://opticom-sms-server.onrender.com';
 const MENTIONS_URL = `${SERVER_BASE}/legal/mentions.md`;
 const PRIVACY_URL  = `${SERVER_BASE}/legal/privacy.md`;
 const CGV_LATEST_URL = `${SERVER_BASE}/legal/cgv-2025-08-14.md`;
+
+const LICENCE_GET = (cle?: string, id?: string) => {
+  const sp = new URLSearchParams();
+  if (cle) sp.set('cle', cle);
+  if (id)  sp.set('licenceId', id);
+  return `${SERVER_BASE}/api/licence?${sp.toString()}`;
+};
 
 // Compat: certains endpoints acceptent `cle`, d'autres `id`/`licenceId`
 const CGV_STATUS = (cle?: string, id?: string) => {
@@ -54,9 +61,9 @@ async function openURLSafe(url: string) {
   try {
     const ok = await Linking.canOpenURL(url);
     if (ok) return Linking.openURL(url);
-    Alert.alert('Lien', "Impossible d’ouvrir l’URL.");
+    Alert.alert('Lien', 'Impossible d’ouvrir l’URL.');
   } catch {
-    Alert.alert('Lien', "Impossible d’ouvrir l’URL.");
+    Alert.alert('Lien', 'Impossible d’ouvrir l’URL.');
   }
 }
 
@@ -96,12 +103,14 @@ export default function SettingsPage() {
   const [loadingPrefs, setLoadingPrefs] = useState(false);
 
   const [cgvInfo, setCgvInfo] = useState<{ accepted?: boolean; acceptedVersion?: string; acceptedAt?: string; currentVersion?: string } | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   const expediteurNormalized = useMemo(() => normalizeSender(expediteurRaw), [expediteurRaw]);
 
-  // charge licence & local
+  // charge licence & local, puis tente une sync serveur
   useEffect(() => {
-    const loadData = async () => {
+    const loadLocalAndSync = async () => {
       try {
         const [storedLicenceRaw, storedSignature, storedMessagesRaw] = await Promise.all([
           AsyncStorage.getItem('licence'),
@@ -157,9 +166,12 @@ export default function SettingsPage() {
       } finally {
         setIsLoading(false);
       }
+
+      // puis tentative de resync depuis serveur
+      await syncFromServer();
     };
 
-    loadData();
+    loadLocalAndSync();
   }, []);
 
   // IDs (réévalués à chaque render)
@@ -189,12 +201,83 @@ export default function SettingsPage() {
     })();
   }, [cleLicence, licenceId]);
 
-  // --- Prefs automations (serveur) ---
+  const syncFromServer = useCallback(async () => {
+    if (!cleLicence && !licenceId) return;
+    try {
+      setSyncing(true);
+      setSyncError(null);
+
+      // 1) Licence: alias + signature (source de vérité serveur)
+      try {
+        const lic = await getJSON(LICENCE_GET(cleLicence, licenceId));
+        if (lic && typeof lic === 'object') {
+          const newLicence = lic.licence || lic; // compat
+          if (newLicence) {
+            setLicence(newLicence);
+            await AsyncStorage.setItem('licence', JSON.stringify(newLicence));
+            const sender = newLicence.libelleExpediteur ||
+                           newLicence.opticien?.enseigne ||
+                           newLicence.nom || 'OptiCOM';
+            setExpediteurRaw(String(sender));
+            if (typeof newLicence.signature === 'string') {
+              setSignature(newLicence.signature);
+              await AsyncStorage.setItem('signature', newLicence.signature);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Licence GET failed:', (e as Error).message);
+      }
+
+      // 2) Prefs: automatisations + messages personnalisés
+      try {
+        const prefs = await getJSON(LICENCE_PREFS_GET(cleLicence, licenceId));
+        // Automates
+        setAutoBirthday(!!prefs.autoBirthdayEnabled);
+        setAutoLensRenewal(!!prefs.autoLensRenewalEnabled);
+        setAutoBirthdayMessage(String(prefs.messageBirthday || 'Joyeux anniversaire {prenom} !'));
+        setAutoLensMessage(String(prefs.messageLensRenewal || 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.'));
+        const lad = Number.isFinite(+prefs.lensAdvanceDays) ? Math.max(0, Math.min(60, +prefs.lensAdvanceDays)) : 10;
+        setLensAdvanceDays(lad);
+        await AsyncStorage.multiSet([
+          ['autoBirthdayEnabled', prefs.autoBirthdayEnabled ? '1' : '0'],
+          ['autoLensRenewalEnabled', prefs.autoLensRenewalEnabled ? '1' : '0'],
+          ['autoBirthdayMessage', String(prefs.messageBirthday || '')],
+          ['autoLensMessage', String(prefs.messageLensRenewal || '')],
+          ['lensAdvanceDays', String(lad)],
+        ]);
+
+        // 🔁 Messages personnalisés (clé serveur: customMessages | manualTemplates)
+        const remoteMsgs = prefs.customMessages || prefs.manualTemplates || null;
+        if (remoteMsgs && typeof remoteMsgs === 'object') {
+          const migrated: Record<string, CustomMessage> = {};
+          for (const key of Object.keys(remoteMsgs)) {
+            const v = remoteMsgs[key];
+            if (typeof v === 'string') migrated[key] = { title: key, content: v };
+            else if (v && typeof v === 'object') {
+              migrated[key] = { title: String(v.title || key), content: String(v.content || '') };
+            }
+          }
+          if (Object.keys(migrated).length > 0) {
+            setMessages(migrated);
+            await AsyncStorage.setItem('messages', JSON.stringify(migrated));
+          }
+        }
+      } catch (e) {
+        console.warn('Prefs GET failed:', (e as Error).message);
+      }
+    } catch (e: any) {
+      setSyncError(e?.message || 'Erreur inconnue');
+    } finally {
+      setSyncing(false);
+    }
+  }, [cleLicence, licenceId]);
+
+  // --- Prefs automations (fallback local si serveur down au montage) ---
   useEffect(() => {
     if (!cleLicence && !licenceId) return;
 
-    const loadPrefs = async () => {
-      setLoadingPrefs(true);
+    const loadPrefsFallback = async () => {
       try {
         const r = await fetch(LICENCE_PREFS_GET(cleLicence, licenceId));
         const j = await r.json();
@@ -214,26 +297,29 @@ export default function SettingsPage() {
           ['autoLensMessage', String(j.messageLensRenewal || '')],
           ['lensAdvanceDays', String(lad)],
         ]);
+
+        // messages si présents
+        const remoteMsgs = j.customMessages || j.manualTemplates || null;
+        if (remoteMsgs && typeof remoteMsgs === 'object') {
+          const migrated: Record<string, CustomMessage> = {};
+          for (const key of Object.keys(remoteMsgs)) {
+            const v = remoteMsgs[key];
+            if (typeof v === 'string') migrated[key] = { title: key, content: v };
+            else if (v && typeof v === 'object') {
+              migrated[key] = { title: String(v.title || key), content: String(v.content || '') };
+            }
+          }
+          if (Object.keys(migrated).length > 0) {
+            setMessages(migrated);
+            await AsyncStorage.setItem('messages', JSON.stringify(migrated));
+          }
+        }
       } catch {
-        // fallback local
-        const [b, l, mb, ml, lad] = await Promise.all([
-          AsyncStorage.getItem('autoBirthdayEnabled'),
-          AsyncStorage.getItem('autoLensRenewalEnabled'),
-          AsyncStorage.getItem('autoBirthdayMessage'),
-          AsyncStorage.getItem('autoLensMessage'),
-          AsyncStorage.getItem('lensAdvanceDays'),
-        ]);
-        setAutoBirthday(b === '1');
-        setAutoLensRenewal(l === '1');
-        if (mb) setAutoBirthdayMessage(mb);
-        if (ml) setAutoLensMessage(ml);
-        setLensAdvanceDays(Number.isFinite(+lad!) ? Math.max(0, Math.min(60, +lad!)) : 10);
-      } finally {
-        setLoadingPrefs(false);
+        // fallback local silencieux (déjà chargé plus haut)
       }
     };
 
-    loadPrefs();
+    loadPrefsFallback();
   }, [cleLicence, licenceId]);
 
   // --- Sauvegardes côté serveur (utilisent cle; id toléré, ignoré sinon) ---
@@ -322,6 +408,7 @@ export default function SettingsPage() {
           lensAdvanceDays: lad,
           messageBirthday: autoBirthdayMessage,
           messageLensRenewal: autoLensMessage,
+          // n'écrase pas les messages manuels ici
         }),
       });
 
@@ -346,6 +433,23 @@ export default function SettingsPage() {
   const handleMessagesSave = async () => {
     try {
       await AsyncStorage.setItem('messages', JSON.stringify(messages));
+
+      // 🔁 Enregistre aussi côté serveur via prefs
+      if (cleLicence) {
+        const res = await fetch(LICENCE_PREFS_POST, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            cle: cleLicence,
+            licenceId, // compat
+            customMessages: messages,       // <— clé serveur privilégiée
+            manualTemplates: messages,      // <— compat éventuelle
+          }),
+        });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok || j?.ok === false) throw new Error(j?.error || 'SERVER_ERROR');
+      }
+
       Alert.alert('Sauvegardé', 'Messages personnalisés enregistrés.');
     } catch {
       Alert.alert('Erreur', 'Impossible de sauvegarder les messages.');
@@ -401,7 +505,13 @@ export default function SettingsPage() {
       contentContainerStyle={styles.container}
       keyboardShouldPersistTaps="handled"
     >
-      <Text style={styles.title}>⚙️ Paramètres OptiCOM</Text>
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+        <Text style={styles.title}>⚙️ Paramètres OptiCOM</Text>
+        <TouchableOpacity onPress={syncFromServer} style={styles.syncBtn}>
+          <Text style={styles.syncBtnText}>{syncing ? '…' : '↻ Sync'}</Text>
+        </TouchableOpacity>
+      </View>
+      {syncError ? <Text style={styles.syncError}>⚠ {syncError}</Text> : null}
 
       {!licence && (
         <View style={[styles.block, { borderColor: '#444', borderWidth: 1 }]}>
@@ -665,4 +775,9 @@ const styles = StyleSheet.create({
 
   linkRow: { paddingVertical: 10 },
   linkText: { color: '#1E90FF', fontSize: 16, fontWeight: '600' },
+
+  // Sync
+  syncBtn: { paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#1f2937', borderRadius: 6 },
+  syncBtnText: { color: '#cdeafe', fontWeight: '600' },
+  syncError: { color: '#ff6b6b', marginTop: 6 },
 });

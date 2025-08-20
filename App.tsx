@@ -1,8 +1,8 @@
 // App.tsx
-import "./src/compat/patchApi"; // doit être importé avant tout le reste
+import './src/compat/patchApi'; // doit être importé avant tout le reste
 import 'react-native-gesture-handler';
 import React, { useEffect, useMemo, useState } from 'react';
-import { View, ActivityIndicator } from 'react-native';
+import { View, ActivityIndicator, Platform } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -23,19 +23,21 @@ import CampagnePage from './CampagnePage';
 import SubscriptionPage from './SubscriptionPage';
 import MerciPage from './MerciPage';
 import MandateValidationPage from './MandateValidationPage';
-import { Platform } from 'react-native';
+
+// 🔄 Sync auto (étape 2)
+import { ClientsSyncProvider } from './src/sync/ClientsSyncContext';
 
 if (Platform.OS === 'web') {
   // @ts-ignore
   require('./app.web.css');
 }
 
-
 const Stack = createStackNavigator();
 
 // Linking de base
 const linkingBase = {
-  prefixes: ['opticom://'],
+  // ajoute le prefix Expo (createURL) en plus du schéma custom
+  prefixes: ['opticom://', Linking.createURL('/')],
   config: {
     screens: {
       LicenceCheckPage: 'licence',
@@ -53,10 +55,29 @@ const linkingBase = {
   },
 };
 
-// API Render → licence par clé
+// API Render → licence par clé (+ fallbacks)
 const API_URL = 'https://opticom-sms-server.onrender.com';
-const licenceByKeyEndpoint = (key: string) =>
-  `${API_URL}/licence-by-key?cle=${encodeURIComponent(key)}`;
+const licenceByKeyCandidates = (key: string) => [
+  `${API_URL}/api/licence/by-key?key=${encodeURIComponent(key)}`,
+  `${API_URL}/licence/by-key?key=${encodeURIComponent(key)}`,
+  `${API_URL}/licence-by-key?cle=${encodeURIComponent(key)}`,
+];
+
+async function fetchLicenceByKey(key: string) {
+  for (const url of licenceByKeyCandidates(key)) {
+    try {
+      const res = await fetch(url);
+      const text = await res.text();
+      if (!res.ok) continue;
+      const data = text ? JSON.parse(text) : null;
+      // tolère { licence: {...} } ou directement l’objet
+      return data?.licence ?? data ?? null;
+    } catch {
+      // essaie l’URL suivante
+    }
+  }
+  return null;
+}
 
 // petit helper pour envelopper chaque écran dans <Screen/>
 const wrap =
@@ -81,7 +102,7 @@ export default function App() {
         if (raw) {
           try {
             const obj = JSON.parse(raw);
-            if (obj?.cle || obj?.key || obj?.licenceKey || obj?.id) {
+            if (obj?.cle || obj?.key || obj?.licence || obj?.licenceKey || obj?.id) {
               setHasLicense(true);
               return;
             }
@@ -92,20 +113,29 @@ export default function App() {
         const legacyKey = await AsyncStorage.getItem('licenceKey');
         if (legacyKey) {
           setHasLicense(true); // on laisse entrer
-          // compléter l’objet en tâche de fond
+
+          // complète l’objet en tâche de fond (fallback multi-routes)
           (async () => {
             try {
-              const res = await fetch(licenceByKeyEndpoint(legacyKey));
-              const data = res.ok ? await res.json() : null;
-              const licence = data?.licence ?? data ?? null;
+              const licence = await fetchLicenceByKey(legacyKey);
               await AsyncStorage.setItem(
                 'licence',
-                JSON.stringify(licence ?? { cle: legacyKey })
+                JSON.stringify(
+                  licence ?? {
+                    // garde compat avec le reste de l’app
+                    licence: legacyKey,
+                    cle: legacyKey,
+                  }
+                )
               );
             } catch {
-              await AsyncStorage.setItem('licence', JSON.stringify({ cle: legacyKey }));
+              await AsyncStorage.setItem(
+                'licence',
+                JSON.stringify({ licence: legacyKey, cle: legacyKey })
+              );
             }
           })();
+
           return;
         }
 
@@ -156,26 +186,28 @@ export default function App() {
   }
 
   return (
-    <NavigationContainer linking={linking}>
-      <Stack.Navigator
-        screenOptions={{ headerShown: false }}
-        initialRouteName={hasLicense ? 'Home' : 'LicenceCheckPage'}
-      >
-        {/* Public */}
-        <Stack.Screen name="LicenceCheckPage" component={wrap(LicenceCheckPage)} />
-        <Stack.Screen name="MandateValidationPage" component={wrap(MandateValidationPage)} />
+    <ClientsSyncProvider>
+      <NavigationContainer linking={linking}>
+        <Stack.Navigator
+          screenOptions={{ headerShown: false }}
+          initialRouteName={hasLicense ? 'Home' : 'LicenceCheckPage'}
+        >
+          {/* Public */}
+          <Stack.Screen name="LicenceCheckPage" component={wrap(LicenceCheckPage)} />
+          <Stack.Screen name="MandateValidationPage" component={wrap(MandateValidationPage)} />
 
-        {/* Privé */}
-        <Stack.Screen name="Home" component={wrap(HomePage)} />
-        <Stack.Screen name="AddClient" component={wrap(AddClientPage)} />
-        <Stack.Screen name="ClientList" component={wrap(ClientListPage)} />
-        <Stack.Screen name="ClientDetails" component={wrap(ClientDetailsPage)} />
-        <Stack.Screen name="Settings" component={wrap(SettingsPage)} />
-        <Stack.Screen name="LicencePage" component={wrap(LicencePage)} />
-        <Stack.Screen name="Campagne" component={wrap(CampagnePage)} />
-        <Stack.Screen name="Subscription" component={wrap(SubscriptionPage)} />
-        <Stack.Screen name="Merci" component={wrap(MerciPage)} />
-      </Stack.Navigator>
-    </NavigationContainer>
+          {/* Privé */}
+          <Stack.Screen name="Home" component={wrap(HomePage)} />
+          <Stack.Screen name="AddClient" component={wrap(AddClientPage)} />
+          <Stack.Screen name="ClientList" component={wrap(ClientListPage)} />
+          <Stack.Screen name="ClientDetails" component={wrap(ClientDetailsPage)} />
+          <Stack.Screen name="Settings" component={wrap(SettingsPage)} />
+          <Stack.Screen name="LicencePage" component={wrap(LicencePage)} />
+          <Stack.Screen name="Campagne" component={wrap(CampagnePage)} />
+          <Stack.Screen name="Subscription" component={wrap(SubscriptionPage)} />
+          <Stack.Screen name="Merci" component={wrap(MerciPage)} />
+        </Stack.Navigator>
+      </NavigationContainer>
+    </ClientsSyncProvider>
   );
 }

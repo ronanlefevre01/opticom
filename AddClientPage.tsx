@@ -63,6 +63,49 @@ const DEFAULT_TEMPLATES: Record<string, string> = {
   Commande:  'Bonjour {prenom} {nom}, votre commande est arrivée !',
 };
 
+/** Récupère (ou résout) le licenceId à partir d’AsyncStorage */
+const getLicenceId = async (): Promise<string | null> => {
+  try {
+    const licStr = await AsyncStorage.getItem('licence');
+    if (!licStr) return null;
+    const lic = JSON.parse(licStr);
+    if (lic?.id) return String(lic.id);
+    if (lic?.licence) {
+      const r = await fetch(`${SERVER_BASE}/api/licence/by-key?key=${encodeURIComponent(lic.licence)}`);
+      if (r.ok) {
+        const { licence } = await r.json();
+        return String(licence.id);
+      }
+    }
+  } catch {}
+  return null;
+};
+
+/** Map vers le format serveur /api/clients/upsert */
+const toServerClient = (local: any, stableId?: string) => {
+  const now = new Date().toISOString();
+  const lensDuration =
+    local.journ30 ? '30j' :
+    local.journ60 ? '60j' :
+    local.journ90 ? '90j' :
+    local.mens6  ? '6mois' :
+    local.mens12 ? '1an'   : null;
+
+  return {
+    id: stableId || local.id || `c-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+    prenom: String(local.prenom || ''),
+    nom: String(local.nom || ''),
+    phone: sanitizePhone(local.telephone || ''),
+    email: String(local.email || ''),
+    naissance: local.dateNaissance || null,   // JJ/MM/AAAA accepté
+    lensStartDate: null,
+    lensEndDate: null,
+    lensDuration,
+    note: '',
+    updatedAt: now,
+  };
+};
+
 /* =========================
  * Page
  * ========================= */
@@ -191,6 +234,7 @@ export default function AddClientPage() {
   const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>, value: boolean) =>
     setter(!value);
 
+  /** SAVE + SYNC SERVEUR */
   const handleSave = async () => {
     const tel = sanitizePhone(telephone.trim());
     if (!tel) return showToast('☎ Numéro obligatoire');
@@ -199,7 +243,9 @@ export default function AddClientPage() {
 
     const now = new Date().toISOString();
 
-    const nouveauClient: any = {
+    // 1) Construire un client local (pour l’UI)
+    const localClient: any = {
+      id: (client as any)?.id, // si on édite, on conserve l'id
       nom,
       prenom,
       telephone: tel,
@@ -232,23 +278,74 @@ export default function AddClientPage() {
       },
       messagesEnvoyes: mode === 'edit' ? (client as any)?.messagesEnvoyes || [] : [],
       createdAt: mode === 'edit' ? (client as any)?.createdAt || now : now,
+      updatedAt: now,
     };
 
+    // 2) Sauvegarde locale immédiate (UX instantanée)
     try {
       const data = await AsyncStorage.getItem('clients');
       let clients: any[] = data ? JSON.parse(data) : [];
 
-      if (mode === 'edit' && (client as any)?.telephone) {
-        clients = clients.filter((c) => c.telephone !== (client as any).telephone);
+      const idxExisting = clients.findIndex(
+        (c) => (localClient.id && c.id === localClient.id) || sanitizePhone(c.telephone) === tel
+      );
+      if (idxExisting >= 0) {
+        clients[idxExisting] = { ...clients[idxExisting], ...localClient };
+      } else {
+        // si pas d'id stable, on en crée un temporaire
+        localClient.id = localClient.id || `c-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+        clients.push(localClient);
       }
 
-      clients.push(nouveauClient);
       await AsyncStorage.setItem('clients', JSON.stringify(clients));
-
-      showToast('✅ Client enregistré');
+      showToast('💾 Client enregistré (local)');
     } catch (error) {
-      console.error('Erreur de sauvegarde :', error);
-      showToast('❌ Échec sauvegarde');
+      console.error('Erreur de sauvegarde locale :', error);
+      showToast('❌ Échec sauvegarde locale');
+    }
+
+    // 3) Push serveur (synchro inter-postes)
+    try {
+      const licenceId = await getLicenceId();
+      if (!licenceId) {
+        console.warn('LicenceId introuvable → pas de synchro serveur');
+        return;
+      }
+
+      const serverClient = toServerClient(
+        { ...localClient, journ30, journ60, journ90, mens6, mens12 },
+        localClient.id
+      );
+
+      const resp = await fetch(`${SERVER_BASE}/api/clients/upsert`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ licenceId, clients: [serverClient] }),
+      });
+
+      if (!resp.ok) {
+        const t = await resp.text();
+        console.error('Push serveur KO:', resp.status, t);
+        showToast('⚠️ Synchro serveur échouée');
+        return;
+      }
+
+      // 4) Met à jour l’entrée locale avec l’id/updatedAt final
+      const data = await AsyncStorage.getItem('clients');
+      let clients: any[] = data ? JSON.parse(data) : [];
+      const j = clients.findIndex(
+        (c) => (localClient.id && c.id === localClient.id) || sanitizePhone(c.telephone) === tel
+      );
+      if (j >= 0) {
+        clients[j].id = serverClient.id;
+        clients[j].updatedAt = serverClient.updatedAt;
+        await AsyncStorage.setItem('clients', JSON.stringify(clients));
+      }
+
+      showToast('☁️ Synchro serveur OK');
+    } catch (e) {
+      console.error('Synchro serveur erreur:', e);
+      showToast('⚠️ Pas de réseau / synchro différée');
     }
   };
 
@@ -270,11 +367,9 @@ export default function AddClientPage() {
     const message = (body || '').trim();
     if (!message) { showToast('❌ Message vide'); return false; }
 
-    const licStr = await AsyncStorage.getItem('licence');
-    const lic = licStr ? JSON.parse(licStr) : null;
-    const cle = lic?.licence || '';
-    const licenceId = lic?.id || lic?.opticien?.id || cle;
-    if (!licenceId && !cle) { showToast('❌ Licence introuvable'); return false; }
+    // récupère licenceId de façon fiable
+    const licenceId = await getLicenceId();
+    if (!licenceId) { showToast('❌ Licence introuvable'); return false; }
 
     // Progress
     setSending(true);
@@ -286,7 +381,7 @@ export default function AddClientPage() {
       const response = await fetch(`${SERVER_BASE}/send-sms`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phoneNumber, message, licenceId, cle }),
+        body: JSON.stringify({ phoneNumber, message, licenceId }),
       });
 
       const data = await response.json().catch(() => ({} as any));
