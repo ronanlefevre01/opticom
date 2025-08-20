@@ -502,46 +502,95 @@ export default function ClientListPage() {
   };
 
   // FIX: reset historique — tente serveur, sinon marqueur local (resets)
-  const resetClientHistory = async (rawPhone: string) => {
-    const ok = await confirmAsync('Réinitialiser l’historique ?', 'Effacer l’historique des SMS de ce client ?', 'Réinitialiser');
-    if (!ok) return;
+  // --- helpers pour le reset anti-retour (stocké localement) ---
+const HISTORY_RESET_KEY = 'smsHistoryResets';
+type HistoryResetMap = Record<string, string>; // phone -> ISO timestamp
 
-    const phone = sanitizePhone(rawPhone);
-    const updated = clients.map((client) =>
-      sanitizePhone(client.telephone) === phone ? { ...client, messagesEnvoyes: [] } : client
-    );
-    setClients(updated);
-    setFilteredClients(updated);
-    await AsyncStorage.setItem('clients', JSON.stringify(updated));
+const loadHistoryResets = async (): Promise<HistoryResetMap> => {
+  try {
+    const raw = await AsyncStorage.getItem(HISTORY_RESET_KEY);
+    const j = raw ? JSON.parse(raw) : {};
+    return j && typeof j === 'object' ? j : {};
+  } catch {
+    return {};
+  }
+};
+const saveHistoryResets = async (map: HistoryResetMap) => {
+  try { await AsyncStorage.setItem(HISTORY_RESET_KEY, JSON.stringify(map)); } catch {}
+};
 
-    // Marqueur local pour bloquer la réapparition via sync
-    const resets = await loadHistoryResets();
-    resets[phone] = new Date().toISOString();
-    await saveHistoryResets(resets);
+// --- normalisation en E.164 FR (+33XXXXXXXXX) ---
+const toE164FR = (raw: string) => {
+  const p = sanitizePhone(raw);
+  if (/^0\d{9}$/.test(p)) return '+33' + p.slice(1);
+  if (p.startsWith('+33')) return p;
+  if (/^33\d{9}$/.test(p)) return '+' + p;
+  // à défaut on renvoie le sanitized (le serveur renormalisera)
+  return p;
+};
 
-    // Tentatives côté serveur (on supporte plusieurs endpoints possibles)
-    try {
-      const licId = (await resolveLicenceId()) || (await getLicenceFromStorage()).licenceId;
-      if (!licId) throw new Error('LICENCE_ID_MISSING');
-      const numero = toE164FR(phone);
+// --- fonction principale corrigée ---
+const resetClientHistory = async (rawPhone: string) => {
+  const ok = await confirmAsync(
+    'Réinitialiser l’historique ?',
+    'Effacer l’historique des SMS de ce client ?',
+    'Réinitialiser'
+  );
+  if (!ok) return;
 
-      const tries = [
-        { url: `${API_BASE}/api/sms-history/erase`, method: 'POST', body: { licenceId: licId, numero } },
-        { url: `${API_BASE}/api/sms-history/erase-for-number`, method: 'POST', body: { licenceId: licId, numero } },
-        { url: `${API_BASE}/api/licence/history/erase`, method: 'POST', body: { licenceId: licId, numero } },
-      ];
-      let okSrv = false;
-      for (const t of tries) {
-        try {
-          const r = await fetch(t.url, { method: t.method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(t.body) });
-          if (r.ok) { okSrv = true; break; }
-        } catch {}
+  const phone = sanitizePhone(rawPhone);
+
+  // 1) purge locale immédiate
+  const updated = clients.map((c) =>
+    sanitizePhone(c.telephone) === phone ? { ...c, messagesEnvoyes: [] } : c
+  );
+  setClients(updated);
+  setFilteredClients(updated);
+  await AsyncStorage.setItem('clients', JSON.stringify(updated));
+
+  // 2) marqueur anti-retour (si le serveur ne purge pas, on n’affichera pas ce qui est plus ancien)
+  const resets = await loadHistoryResets();
+  resets[phone] = new Date().toISOString();
+  await saveHistoryResets(resets);
+
+  // 3) tentative de purge côté serveur (facultatif mais idéal)
+  try {
+    const { licenceId: storedId } = await getLicenceFromStorage();
+    const licId = storedId || (await resolveLicenceId());
+    if (!licId) throw new Error('LICENCE_ID_MISSING');
+
+    const numero = toE164FR(phone);
+    const tries = [
+      { url: `${API_BASE}/api/sms-history/erase-for-number`, body: { licenceId: licId, numero } },
+      { url: `${API_BASE}/api/sms-history/erase`,           body: { licenceId: licId, numero } },
+      { url: `${API_BASE}/licence/history/erase-for-number`, body: { licenceId: licId, numero } },
+      { url: `${API_BASE}/api/licence/history/erase`,        body: { licenceId: licId, numero } },
+    ];
+
+    let okSrv = false;
+    for (const t of tries) {
+      try {
+        const r = await fetch(t.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(t.body),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok && (j?.ok === true || j?.removed >= 0)) { okSrv = true; break; }
+      } catch {
+        // ignore et on tente l’URL suivante
       }
-      if (!okSrv) {
-        // pas grave — le reset local empêchera le retour
-      }
-    } catch {}
-  };
+    }
+    if (!okSrv) {
+      // Pas grave : le marqueur local empêche la réapparition à la prochaine sync.
+      // Tu peux afficher un toast si tu veux prévenir l’utilisateur.
+      console.warn('Purge serveur non confirmée — fallback local actif.');
+    }
+  } catch (e) {
+    console.warn('Purge serveur impossible — fallback local actif.', e);
+  }
+};
+
 
   const getTemplateString = (key: SMSCategory) => {
     const v = customMessages[key];
