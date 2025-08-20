@@ -1,9 +1,12 @@
-// SettingsPage.tsx — API unifiée "cle" + compat pour CGV/prefs
-// - GET  /api/licence?cle=...
-// - PUT  /api/licence/expediteur { cle, expediteur }
-// - PUT  /api/licence/signature  { cle, signature }
-// - GET  /api/licence/prefs?cle=...&licenceId=...
-// - POST /api/licence/prefs      { cle, licenceId, ... }
+// SettingsPage.tsx — sync serveur : alias expéditeur, signature, prefs & TEMPLATES (partagés)
+// Endpoints utilisés :
+//  - GET  /api/licence?cle=...&id=...     (retourne { licence })
+//  - POST /licence/expediteur             { licenceId, libelleExpediteur }
+//  - POST /licence/signature              { licenceId, signature }
+//  - GET  /api/licence/prefs?licenceId=... (automatisations)
+//  - POST /api/licence/prefs              { licenceId, ... }
+//  - GET  /api/templates?licenceId=...    -> { items: Template[] }
+//  - POST /api/templates/save             { licenceId, items: Template[] }
 
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import {
@@ -16,27 +19,37 @@ import Icon from 'react-native-vector-icons/MaterialIcons';
 
 const SERVER_BASE = 'https://opticom-sms-server.onrender.com';
 
-// --- URLs ---
+// --- URLs légales ---
 const MENTIONS_URL = `${SERVER_BASE}/legal/mentions.md`;
 const PRIVACY_URL  = `${SERVER_BASE}/legal/privacy.md`;
 const CGV_LATEST_URL = `${SERVER_BASE}/legal/cgv-2025-08-14.md`;
 
-// Compat: certains endpoints acceptent `cle`, d'autres `id`/`licenceId`
+// --- API builders ---
+const LICENCE_GET = (cle?: string, id?: string) => {
+  const sp = new URLSearchParams();
+  if (cle) sp.set('cle', cle);
+  if (id)  sp.set('id', id);                 // <-- le serveur attend "id" (pas "licenceId") ici
+  return `${SERVER_BASE}/api/licence?${sp.toString()}`;
+};
+
 const CGV_STATUS = (cle?: string, id?: string) => {
   const sp = new URLSearchParams();
   if (cle) sp.set('cle', cle);
-  if (id)  { sp.set('id', id); sp.set('licenceId', id); }
+  if (id)  sp.set('licenceId', id);          // cet endpoint lit "licenceId"
   return `${SERVER_BASE}/licence/cgv-status?${sp.toString()}`;
 };
-const LICENCE_PREFS_GET = (cle?: string, id?: string) => {
-  const sp = new URLSearchParams();
-  if (cle) sp.set('cle', cle);
-  if (id)  sp.set('licenceId', id);
-  return `${SERVER_BASE}/api/licence/prefs?${sp.toString()}`;
-};
+
+const LICENCE_PREFS_GET = (licenceId: string) =>
+  `${SERVER_BASE}/api/licence/prefs?licenceId=${encodeURIComponent(licenceId)}`;
 const LICENCE_PREFS_POST = `${SERVER_BASE}/api/licence/prefs`;
 
+const TEMPLATES_GET = (licenceId: string) =>
+  `${SERVER_BASE}/api/templates?licenceId=${encodeURIComponent(licenceId)}`;
+const TEMPLATES_SAVE = `${SERVER_BASE}/api/templates/save`;
+
+// --- Types ---
 type CustomMessage = { title: string; content: string };
+type TemplateItem = { id: string; label: string; text: string };
 
 const safeParseJSON = <T = any,>(raw: string | null): T | null => {
   if (!raw) return null;
@@ -54,25 +67,14 @@ async function openURLSafe(url: string) {
   try {
     const ok = await Linking.canOpenURL(url);
     if (ok) return Linking.openURL(url);
-    Alert.alert('Lien', "Impossible d’ouvrir l’URL.");
+    Alert.alert('Lien', 'Impossible d’ouvrir l’URL.');
   } catch {
-    Alert.alert('Lien', "Impossible d’ouvrir l’URL.");
+    Alert.alert('Lien', 'Impossible d’ouvrir l’URL.');
   }
 }
 
-// Helpers fetch
 async function getJSON(url: string) {
   const r = await fetch(url);
-  const t = await r.text();
-  if (!r.ok) throw new Error(`HTTP ${r.status}: ${t}`);
-  return t ? JSON.parse(t) : {};
-}
-async function putJSON(path: string, body: any) {
-  const r = await fetch(`${SERVER_BASE}${path}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
   const t = await r.text();
   if (!r.ok) throw new Error(`HTTP ${r.status}: ${t}`);
   return t ? JSON.parse(t) : {};
@@ -82,6 +84,7 @@ export default function SettingsPage() {
   const [licence, setLicence] = useState<any>(null); // contient la clé sous licence.licence
   const [expediteurRaw, setExpediteurRaw] = useState('');
   const [signature, setSignature] = useState('');
+  // messages stockés par ID (clé = id template)
   const [messages, setMessages] = useState<Record<string, CustomMessage>>({});
   const navigation = useNavigation();
   const [showLogoutModal, setShowLogoutModal] = useState(false);
@@ -93,15 +96,20 @@ export default function SettingsPage() {
   const [autoBirthdayMessage, setAutoBirthdayMessage] = useState('Joyeux anniversaire {prenom} !');
   const [autoLensMessage, setAutoLensMessage] = useState('Bonjour {prenom}, pensez au renouvellement de vos lentilles.');
   const [lensAdvanceDays, setLensAdvanceDays] = useState<number>(10);
-  const [loadingPrefs, setLoadingPrefs] = useState(false);
 
   const [cgvInfo, setCgvInfo] = useState<{ accepted?: boolean; acceptedVersion?: string; acceptedAt?: string; currentVersion?: string } | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   const expediteurNormalized = useMemo(() => normalizeSender(expediteurRaw), [expediteurRaw]);
 
-  // charge licence & local
+  // IDs (réévalués)
+  const cleLicence = String(licence?.licence || '').trim();
+  const licenceId = String(licence?.id || '').trim();
+
+  // ------ Chargement initial (local) puis sync serveur ------
   useEffect(() => {
-    const loadData = async () => {
+    (async () => {
       try {
         const [storedLicenceRaw, storedSignature, storedMessagesRaw] = await Promise.all([
           AsyncStorage.getItem('licence'),
@@ -127,6 +135,7 @@ export default function SettingsPage() {
           if (typeof storedSignature === 'string') setSignature(storedSignature);
         }
 
+        // Migration locale anciens messages
         if (storedMessagesRaw) {
           const parsed = safeParseJSON<any>(storedMessagesRaw);
           if (parsed && typeof parsed === 'object') {
@@ -157,16 +166,13 @@ export default function SettingsPage() {
       } finally {
         setIsLoading(false);
       }
-    };
 
-    loadData();
+      // puis sync serveur
+      await syncFromServer(true);
+    })();
   }, []);
 
-  // IDs (réévalués à chaque render)
-  const cleLicence = String(licence?.licence || '').trim();
-  const licenceId = String(licence?.id || licence?.opticien?.id || '').trim();
-
-  // --- CGV depuis le serveur (clé/id requis selon handler) ---
+  // --- CGV depuis le serveur ---
   useEffect(() => {
     if (!cleLicence && !licenceId) { setCgvInfo(null); return; }
     (async () => {
@@ -189,86 +195,129 @@ export default function SettingsPage() {
     })();
   }, [cleLicence, licenceId]);
 
-  // --- Prefs automations (serveur) ---
-  useEffect(() => {
+  // ------ Sync serveur : licence, prefs, templates ------
+  const syncFromServer = useCallback(async (initial = false) => {
     if (!cleLicence && !licenceId) return;
+    try {
+      setSyncing(true);
+      setSyncError(null);
 
-    const loadPrefs = async () => {
-      setLoadingPrefs(true);
+      // 1) Licence: alias + signature
       try {
-        const r = await fetch(LICENCE_PREFS_GET(cleLicence, licenceId));
-        const j = await r.json();
-        if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
-
-        setAutoBirthday(!!j.autoBirthdayEnabled);
-        setAutoLensRenewal(!!j.autoLensRenewalEnabled);
-        setAutoBirthdayMessage(String(j.messageBirthday || 'Joyeux anniversaire {prenom} !'));
-        setAutoLensMessage(String(j.messageLensRenewal || 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.'));
-        const lad = Number.isFinite(+j.lensAdvanceDays) ? Math.max(0, Math.min(60, +j.lensAdvanceDays)) : 10;
-        setLensAdvanceDays(lad);
-
-        await AsyncStorage.multiSet([
-          ['autoBirthdayEnabled', j.autoBirthdayEnabled ? '1' : '0'],
-          ['autoLensRenewalEnabled', j.autoLensRenewalEnabled ? '1' : '0'],
-          ['autoBirthdayMessage', String(j.messageBirthday || '')],
-          ['autoLensMessage', String(j.messageLensRenewal || '')],
-          ['lensAdvanceDays', String(lad)],
-        ]);
-      } catch {
-        // fallback local
-        const [b, l, mb, ml, lad] = await Promise.all([
-          AsyncStorage.getItem('autoBirthdayEnabled'),
-          AsyncStorage.getItem('autoLensRenewalEnabled'),
-          AsyncStorage.getItem('autoBirthdayMessage'),
-          AsyncStorage.getItem('autoLensMessage'),
-          AsyncStorage.getItem('lensAdvanceDays'),
-        ]);
-        setAutoBirthday(b === '1');
-        setAutoLensRenewal(l === '1');
-        if (mb) setAutoBirthdayMessage(mb);
-        if (ml) setAutoLensMessage(ml);
-        setLensAdvanceDays(Number.isFinite(+lad!) ? Math.max(0, Math.min(60, +lad!)) : 10);
-      } finally {
-        setLoadingPrefs(false);
+        const licResp = await getJSON(LICENCE_GET(cleLicence, licenceId));
+        const newLicence = licResp?.licence ?? licResp;
+        if (newLicence) {
+          setLicence(newLicence);
+          await AsyncStorage.setItem('licence', JSON.stringify(newLicence));
+          const sender = newLicence.libelleExpediteur ||
+                         newLicence.opticien?.enseigne ||
+                         newLicence.nom || 'OptiCOM';
+          setExpediteurRaw(String(sender));
+          if (typeof newLicence.signature === 'string') {
+            setSignature(newLicence.signature);
+            await AsyncStorage.setItem('signature', newLicence.signature);
+          }
+        }
+      } catch (e) {
+        if (!initial) console.warn('Licence GET failed:', (e as Error).message);
       }
-    };
 
-    loadPrefs();
-  }, [cleLicence, licenceId]);
+      // 2) Prefs automatisations
+      if (licenceId) {
+        try {
+          const prefs = await getJSON(LICENCE_PREFS_GET(licenceId));
+          setAutoBirthday(!!prefs.autoBirthdayEnabled);
+          setAutoLensRenewal(!!prefs.autoLensRenewalEnabled);
+          setAutoBirthdayMessage(String(prefs.messageBirthday || 'Joyeux anniversaire {prenom} !'));
+          setAutoLensMessage(String(prefs.messageLensRenewal || 'Bonjour {prenom}, pensez au renouvellement de vos lentilles.'));
+          const lad = Number.isFinite(+prefs.lensAdvanceDays) ? Math.max(0, Math.min(60, +prefs.lensAdvanceDays)) : 10;
+          setLensAdvanceDays(lad);
+          await AsyncStorage.multiSet([
+            ['autoBirthdayEnabled', prefs.autoBirthdayEnabled ? '1' : '0'],
+            ['autoLensRenewalEnabled', prefs.autoLensRenewalEnabled ? '1' : '0'],
+            ['autoBirthdayMessage', String(prefs.messageBirthday || '')],
+            ['autoLensMessage', String(prefs.messageLensRenewal || '')],
+            ['lensAdvanceDays', String(lad)],
+          ]);
+        } catch (e) {
+          if (!initial) console.warn('Prefs GET failed:', (e as Error).message);
+        }
+      }
 
-  // --- Sauvegardes côté serveur (utilisent cle; id toléré, ignoré sinon) ---
+      // 3) TEMPLATES (messages manuels — PARTAGÉS)
+      if (licenceId) {
+        try {
+          const t = await getJSON(TEMPLATES_GET(licenceId));
+          const items: TemplateItem[] = Array.isArray(t?.items) ? t.items : [];
+          if (items.length) {
+            const next: Record<string, CustomMessage> = {};
+            for (const it of items) {
+              next[it.id] = { title: String(it.label || ''), content: String(it.text || '') };
+            }
+            setMessages(next);
+            await AsyncStorage.setItem('messages', JSON.stringify(next));
+          } else if (initial) {
+            // si pas de templates serveur au premier sync, on pousse nos défauts locaux
+            await saveTemplatesToServer(licenceId, messages);
+          }
+        } catch (e) {
+          if (!initial) console.warn('Templates GET failed:', (e as Error).message);
+        }
+      }
+    } catch (e: any) {
+      setSyncError(e?.message || 'Erreur inconnue');
+    } finally {
+      setSyncing(false);
+    }
+  }, [cleLicence, licenceId, messages]);
+
+  // ------ Save expéditeur / signature (POST vers /licence/*) ------
   const saveSenderRemote = useCallback(
     async (normalized: string) => {
-      if (!cleLicence) return false;
+      if (!licenceId) return false;
       try {
-        const data = await putJSON(`/api/licence/expediteur`, { cle: cleLicence, expediteur: normalized, licenceId });
-        if ((data?.ok ?? true) && data?.licence) {
-          setLicence(data.licence);
-          try { await AsyncStorage.setItem('licence', JSON.stringify(data.licence)); } catch {}
+        const r = await fetch(`${SERVER_BASE}/licence/expediteur`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ licenceId, libelleExpediteur: normalized }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
+        if (j?.licence) {
+          setLicence(j.licence);
+          await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
         }
         return true;
-      } catch {
+      } catch (e) {
+        console.warn('saveSenderRemote error:', e);
         return false;
       }
     },
-    [cleLicence, licenceId]
+    [licenceId]
   );
 
   const saveSignatureRemote = useCallback(
     async (sig: string) => {
-      if (!cleLicence) return false;
+      if (!licenceId) return false;
       try {
-        const data = await putJSON(`/api/licence/signature`, { cle: cleLicence, signature: sig, licenceId });
-        if ((data?.ok ?? true) && data?.licence) {
-          setLicence(data.licence);
-          try { await AsyncStorage.setItem('licence', JSON.stringify(data.licence)); } catch {}
+        const r = await fetch(`${SERVER_BASE}/licence/signature`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ licenceId, signature: sig }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
+        if (j?.licence) {
+          setLicence(j.licence);
+          await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
         }
         return true;
-      } catch {
+      } catch (e) {
+        console.warn('saveSignatureRemote error:', e);
         return false;
       }
     },
-    [cleLicence, licenceId]
+    [licenceId]
   );
 
   const handleSaveBasics = async () => {
@@ -278,7 +327,6 @@ export default function SettingsPage() {
         Alert.alert('Expéditeur', 'Doit contenir 3 à 11 caractères alphanumériques.');
         return;
       }
-
       await AsyncStorage.setItem('signature', signature);
       if (licence) {
         const updated = { ...licence, libelleExpediteur: normalized, signature };
@@ -294,6 +342,8 @@ export default function SettingsPage() {
 
       if (okSender || okSig) {
         Alert.alert('Paramètres', 'Enregistrés avec succès.');
+        // relit la licence côté serveur pour refléter la normalisation
+        await syncFromServer();
       } else {
         Alert.alert('Paramètres', 'Enregistré localement. (Serveur indisponible)');
       }
@@ -302,21 +352,19 @@ export default function SettingsPage() {
     }
   };
 
+  // ------ Automatisations ------
   const handleSaveAutomations = async () => {
     try {
-      if (!cleLicence) {
+      if (!licenceId) {
         Alert.alert('Licence', 'Veuillez vous connecter à une licence avant de sauvegarder.');
         return;
       }
-
       const lad = Math.max(0, Math.min(60, Number.isFinite(+lensAdvanceDays) ? +lensAdvanceDays : 10));
-
       const res = await fetch(LICENCE_PREFS_POST, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          cle: cleLicence,
-          licenceId, // compat serveur
+          licenceId,
           autoBirthdayEnabled: autoBirthday,
           autoLensRenewalEnabled: autoLensRenewal,
           lensAdvanceDays: lad,
@@ -324,7 +372,6 @@ export default function SettingsPage() {
           messageLensRenewal: autoLensMessage,
         }),
       });
-
       const j = await res.json();
       if (!res.ok || j?.ok === false) throw new Error(j?.error || 'SERVER_ERROR');
 
@@ -343,18 +390,53 @@ export default function SettingsPage() {
     }
   };
 
+  // ------ Templates (messages manuels PARTAGÉS) ------
+  const saveTemplatesToServer = useCallback(
+    async (licId: string, map: Record<string, CustomMessage>) => {
+      const items: TemplateItem[] = Object.entries(map).map(([id, v]) => ({
+        id,
+        label: v.title ?? id,
+        text: v.content ?? '',
+      }));
+      const r = await fetch(TEMPLATES_SAVE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ licenceId: licId, items }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j?.ok === false) throw new Error(j?.error || `HTTP ${r.status}`);
+      return j;
+    },
+    []
+  );
+
   const handleMessagesSave = async () => {
     try {
       await AsyncStorage.setItem('messages', JSON.stringify(messages));
-      Alert.alert('Sauvegardé', 'Messages personnalisés enregistrés.');
-    } catch {
+
+      if (licenceId) {
+        await saveTemplatesToServer(licenceId, messages);
+        // re-fetch pour refléter la normalisation serveur (trim/limit)
+        const t = await getJSON(TEMPLATES_GET(licenceId));
+        const items: TemplateItem[] = Array.isArray(t?.items) ? t.items : [];
+        const next: Record<string, CustomMessage> = {};
+        for (const it of items) next[it.id] = { title: String(it.label || ''), content: String(it.text || '') };
+        if (Object.keys(next).length) {
+          setMessages(next);
+          await AsyncStorage.setItem('messages', JSON.stringify(next));
+        }
+      }
+
+      Alert.alert('Sauvegardé', 'Messages personnalisés enregistrés (partagés).');
+    } catch (e) {
+      console.log('Templates save error:', e);
       Alert.alert('Erreur', 'Impossible de sauvegarder les messages.');
     }
   };
 
   const handleAddMessage = () => {
-    const newKey = 'MessagePerso' + Date.now();
-    setMessages((prev) => ({ ...prev, [newKey]: { title: 'Nouveau message', content: '' } }));
+    const newId = 'msg-' + Date.now();
+    setMessages((prev) => ({ ...prev, [newId]: { title: 'Nouveau message', content: '' } }));
   };
 
   const handleDeleteMessage = (key: string) => {
@@ -401,7 +483,13 @@ export default function SettingsPage() {
       contentContainerStyle={styles.container}
       keyboardShouldPersistTaps="handled"
     >
-      <Text style={styles.title}>⚙️ Paramètres OptiCOM</Text>
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+        <Text style={styles.title}>⚙️ Paramètres OptiCOM</Text>
+        <TouchableOpacity onPress={() => syncFromServer()} style={styles.syncBtn}>
+          <Text style={styles.syncBtnText}>{syncing ? '…' : '↻ Sync'}</Text>
+        </TouchableOpacity>
+      </View>
+      {syncError ? <Text style={styles.syncError}>⚠ {syncError}</Text> : null}
 
       {!licence && (
         <View style={[styles.block, { borderColor: '#444', borderWidth: 1 }]}>
@@ -534,11 +622,12 @@ export default function SettingsPage() {
           Ex. durée 90 jours → SMS à J-10 (80e jour). Durée 6 mois → SMS à 5 mois et 20 jours.
         </Text>
 
-        <TouchableOpacity style={[styles.button, { marginTop: 12, opacity: loadingPrefs ? 0.7 : 1 }]} onPress={handleSaveAutomations} disabled={loadingPrefs}>
-          <Text style={styles.buttonText}>{loadingPrefs ? '⏳ Sauvegarde…' : '💾 Sauvegarder les automatisations'}</Text>
+        <TouchableOpacity style={[styles.button, { marginTop: 12 }]} onPress={handleSaveAutomations}>
+          <Text style={styles.buttonText}>💾 Sauvegarder les automatisations</Text>
         </TouchableOpacity>
       </View>
 
+      {/* Messages manuels partagés (TEMPLATES) */}
       <View style={styles.block}>
         <Text style={styles.label}>Messages personnalisés (manuels) :</Text>
 
@@ -569,7 +658,7 @@ export default function SettingsPage() {
           <Text style={styles.buttonText}>➕ Ajouter un message</Text>
         </TouchableOpacity>
         <TouchableOpacity style={styles.button} onPress={handleMessagesSave}>
-          <Text style={styles.buttonText}>💾 Enregistrer les messages</Text>
+          <Text style={styles.buttonText}>💾 Enregistrer les messages (partagés)</Text>
         </TouchableOpacity>
         <Text style={[styles.label, { marginTop: 6, color: '#8aa' }]}>
           Placeholders disponibles : {'{prenom}'} et {'{nom}'}.
@@ -665,4 +754,8 @@ const styles = StyleSheet.create({
 
   linkRow: { paddingVertical: 10 },
   linkText: { color: '#1E90FF', fontSize: 16, fontWeight: '600' },
+
+  syncBtn: { paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#1f2937', borderRadius: 6 },
+  syncBtnText: { color: '#cdeafe', fontWeight: '600' },
+  syncError: { color: '#ff6b6b', marginTop: 6 },
 });

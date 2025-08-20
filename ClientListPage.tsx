@@ -25,12 +25,37 @@ const getLicenceFromStorage = async (): Promise<{ licenceId: string | null; cle:
     const raw = await AsyncStorage.getItem('licence');
     if (!raw) return { licenceId: null, cle: null };
     const lic = JSON.parse(raw);
-    const licenceId = String(lic?.id || lic?.opticien?.id || '').trim() || null;
+    const licenceId = String(lic?.id || '').trim() || null;
     const cle = String(lic?.licence || '').trim() || null;
     return { licenceId, cle };
   } catch {
     return { licenceId: null, cle: null };
   }
+};
+
+/** Résout un licenceId fiable (si on n’a que la clé) */
+const resolveLicenceId = async (): Promise<string | null> => {
+  const { licenceId, cle } = await getLicenceFromStorage();
+  if (licenceId) return licenceId;
+  if (!cle) return null;
+
+  const candidates = [
+    `${API_BASE}/api/licence/by-key?key=${encodeURIComponent(cle)}`,
+    `${API_BASE}/licence/by-key?key=${encodeURIComponent(cle)}`,
+    `${API_BASE}/licence?key=${encodeURIComponent(cle)}`,
+    `${API_BASE}/api/licence?cle=${encodeURIComponent(cle)}`,
+  ];
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url);
+      const text = await res.text();
+      if (!res.ok) continue;
+      const data = JSON.parse(text);
+      const id = data?.licence?.id || data?.id || data?.licence?.opticien?.id;
+      if (id) return String(id);
+    } catch {}
+  }
+  return null;
 };
 
 const getSignatureFromSettings = async (): Promise<string> => {
@@ -64,6 +89,7 @@ const appendSignature = (msg: string, sig: string) => {
 const confirmAsync = (title: string, message: string, okText = 'Supprimer') =>
   new Promise<boolean>((resolve) => {
     if (Platform.OS === 'web') {
+      // @ts-ignore web only
       resolve(window.confirm(`${title}\n\n${message}`));
     } else {
       Alert.alert(title, message, [
@@ -73,25 +99,39 @@ const confirmAsync = (title: string, message: string, okText = 'Supprimer') =>
     }
   });
 
+/** ✅ Lit les crédits directement depuis la licence (JSONBin) */
 const fetchCreditsFromServer = async (licenceId: string): Promise<number | null> => {
   const urls = [
-    `${API_BASE}/licence/credits?licenceId=${encodeURIComponent(licenceId)}`,
-    `${API_BASE}/licence-credits?licenceId=${encodeURIComponent(licenceId)}`,
-    `${API_BASE}/credits?licenceId=${encodeURIComponent(licenceId)}`,
+    `${API_BASE}/api/licence?id=${encodeURIComponent(licenceId)}`,
+    `${API_BASE}/licence?id=${encodeURIComponent(licenceId)}`,
   ];
-  let lastErr: any = null;
   for (const url of urls) {
     try {
       const res = await fetch(url);
       const text = await res.text();
-      if (!res.ok) { lastErr = new Error(`HTTP ${res.status}: ${text}`); continue; }
-      let data: any = {};
-      try { data = JSON.parse(text); } catch { continue; }
+      if (!res.ok) continue;
+      const data = JSON.parse(text);
+      const lic = data?.licence ?? data;
+      const credits = lic?.credits;
+      if (typeof credits === 'number') return credits;
+    } catch {}
+  }
+  // anciens fallbacks (au cas où)
+  const fallbacks = [
+    `${API_BASE}/licence/credits?licenceId=${encodeURIComponent(licenceId)}`,
+    `${API_BASE}/licence-credits?licenceId=${encodeURIComponent(licenceId)}`,
+    `${API_BASE}/credits?licenceId=${encodeURIComponent(licenceId)}`,
+  ];
+  for (const url of fallbacks) {
+    try {
+      const res = await fetch(url);
+      const text = await res.text();
+      if (!res.ok) continue;
+      const data = JSON.parse(text);
       const credits = data?.credits ?? data?.remaining ?? data?.solde ?? (typeof data === 'number' ? data : null);
       if (typeof credits === 'number') return credits;
-    } catch (e) { lastErr = e; }
+    } catch {}
   }
-  console.warn('Credits endpoint unavailable:', lastErr?.message || lastErr);
   return null;
 };
 
@@ -102,6 +142,134 @@ const DEFAULT_TEMPLATES: Record<SMSCategory, string> = {
   SAV:       'Bonjour {prenom} {nom}, votre SAV est terminé, vous pouvez venir le récupérer.',
   Lentilles: 'Bonjour {prenom} {nom}, vos lentilles sont disponibles en magasin.',
   Commande:  'Bonjour {prenom} {nom}, votre commande est arrivée !',
+};
+
+/** ---- parsing & mapping clients serveur -> local ---- */
+const extractServerItems = (payload: any): any[] => {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload.items)) return payload.items;
+  if (payload.clients && Array.isArray(payload.clients)) return payload.clients;
+  return [];
+};
+
+const serverToLocalClient = (s: any): Client => {
+  const phone = sanitizePhone(s.phone || s.telephone || '');
+  const lentilles: string[] = [];
+  const dur = String(s.lensDuration || '').toLowerCase();
+  if (dur === '30j') lentilles.push('30j');
+  if (dur === '60j') lentilles.push('60j');
+  if (dur === '90j') lentilles.push('90j');
+  if (dur === '6mois') lentilles.push('6mois');
+  if (dur === '1an') lentilles.push('1an');
+
+  return {
+    id: s.id || `srv-${phone}`,
+    prenom: s.prenom || '',
+    nom: s.nom || '',
+    telephone: phone,
+    email: s.email || '',
+    dateNaissance: s.naissance || '',
+    lunettes: !!s.lunettes,
+    lentilles,
+    consentementMarketing: !!s.consentementMarketing,
+    consent: s.consent || {
+      service_sms: { value: true },
+      marketing_sms: { value: !!s.consentementMarketing },
+    },
+    messagesEnvoyes: Array.isArray(s.messagesEnvoyes) ? s.messagesEnvoyes : [],
+    createdAt: s.createdAt || new Date().toISOString(),
+  } as Client;
+};
+
+/** Merge serveur + local par téléphone (on garde l’historique local) */
+const mergeLocalWithServer = (local: Client[], server: Client[]) => {
+  const byPhone = new Map<string, Client>();
+  for (const c of server) byPhone.set(sanitizePhone(c.telephone), c);
+
+  const merged: Client[] = [];
+
+  // Inject serveur, en fusionnant historique depuis local
+  for (const s of server) {
+    const key = sanitizePhone(s.telephone);
+    const l = local.find((x) => sanitizePhone(x.telephone) === key);
+    if (l && Array.isArray(l.messagesEnvoyes) && l.messagesEnvoyes.length) {
+      const seen = new Set((Array.isArray(s.messagesEnvoyes) ? s.messagesEnvoyes : []).map((m: any) => `${m.type}|${m.date}`));
+      const out = Array.isArray(s.messagesEnvoyes) ? [...s.messagesEnvoyes] : [];
+      for (const m of l.messagesEnvoyes) {
+        const id = `${m.type}|${m.date}`;
+        if (!seen.has(id)) out.push(m);
+      }
+      merged.push({ ...s, messagesEnvoyes: out });
+    } else {
+      merged.push(s);
+    }
+  }
+
+  // Ajoute locaux “non présents serveur”
+  for (const l of local) {
+    const key = sanitizePhone(l.telephone);
+    if (!byPhone.has(key)) merged.push(l);
+  }
+
+  return merged;
+};
+
+/** GET clients depuis serveur (avec fallbacks d’URL) */
+const fetchClientsFromServer = async (licenceId: string): Promise<Client[] | null> => {
+  const urls = [
+    `${API_BASE}/api/clients?licenceId=${encodeURIComponent(licenceId)}`,
+    `${API_BASE}/clients?licenceId=${encodeURIComponent(licenceId)}`,
+    `${API_BASE}/licence/clients?licenceId=${encodeURIComponent(licenceId)}`,
+  ];
+  for (const url of urls) {
+    try {
+      const res = await fetch(url);
+      const text = await res.text();
+      if (!res.ok) continue;
+      const data = JSON.parse(text);
+      const items = extractServerItems(data);
+      if (!Array.isArray(items)) continue;
+      return items.map(serverToLocalClient);
+    } catch {}
+  }
+  return null;
+};
+
+/** ---- Historique SMS depuis la licence (JSONBin) ---- */
+type ServerSmsItem = { date: string; type: string; numero: string; emetteur?: string; textHash?: string };
+
+const labelFromType = (t: string) => {
+  if (t === 'marketing') return 'Marketing';
+  if (t === 'transactional') return 'Transactionnel';
+  if (t === 'auto-anniv') return 'Anniv auto';
+  if (t === 'auto-renew') return 'Renouvellement auto';
+  return 'SMS';
+};
+
+/** ✅ Récupère { licence } puis retourne licence.historiqueSms[] */
+const fetchSmsHistoryFromLicence = async (licenceId: string, cle: string | null): Promise<ServerSmsItem[]> => {
+  const urls: string[] = [
+    `${API_BASE}/api/licence?id=${encodeURIComponent(licenceId)}`,
+  ];
+  if (cle) {
+    urls.push(
+      `${API_BASE}/api/licence?cle=${encodeURIComponent(cle)}`,
+      `${API_BASE}/licence?cle=${encodeURIComponent(cle)}`
+    );
+  }
+  for (const url of urls) {
+    try {
+      const r = await fetch(url);
+      const txt = await r.text();
+      if (!r.ok) continue;
+      const data = JSON.parse(txt);
+      const lic = data?.licence ?? data;
+      const items: ServerSmsItem[] = Array.isArray(lic?.historiqueSms) ? lic.historiqueSms : [];
+      return items;
+    } catch {}
+  }
+  return [];
 };
 
 export default function ClientListPage() {
@@ -126,9 +294,14 @@ export default function ClientListPage() {
   const [customModalVisible, setCustomModalVisible] = useState(false);
   const [customText, setCustomText] = useState('');
 
-  // ✅ nouvelle modale de choix de type (web-friendly)
+  // ✅ modale choix de type
   const [typeModalVisible, setTypeModalVisible] = useState(false);
 
+  // 🔄 état sync
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  // Chargement local + synchro serveur au montage
   useEffect(() => {
     const loadData = async () => {
       const clientData = await AsyncStorage.getItem('clients');
@@ -141,10 +314,13 @@ export default function ClientListPage() {
       if (messageData) {
         try { setCustomMessages(JSON.parse(messageData)); } catch {}
       }
+      // Première synchro
+      await syncFromServer();
     };
     loadData();
   }, []);
 
+  // Filtrage recherche / type
   useEffect(() => {
     const lower = searchQuery.toLowerCase();
     let result = clients.filter(
@@ -160,6 +336,69 @@ export default function ClientListPage() {
     }
     setFilteredClients(result);
   }, [searchQuery, smsFilter, clients]);
+
+  const syncFromServer = async () => {
+    try {
+      setSyncing(true);
+      setSyncError(null);
+
+      const { licenceId: storedId, cle } = await getLicenceFromStorage();
+      const licenceId = storedId || (await resolveLicenceId());
+      if (!licenceId) {
+        setSyncError('Licence introuvable');
+        setSyncing(false);
+        return;
+      }
+
+      // ➊ Clients distants
+      const remote = await fetchClientsFromServer(licenceId);
+      if (!remote) {
+        setSyncError('Serveur indisponible');
+        setSyncing(false);
+        return;
+      }
+
+      // ➋ Historique côté licence (JSONBin)
+      const licenceHistory = await fetchSmsHistoryFromLicence(licenceId, cle);
+
+      // ➌ Indexer l’historique par téléphone (sanitisé)
+      const byPhone = new Map<string, { date: string; type: string }[]>();
+      for (const h of licenceHistory) {
+        const key = sanitizePhone(h.numero || '');
+        if (!key) continue;
+        if (!byPhone.has(key)) byPhone.set(key, []);
+        byPhone.get(key)!.push({ date: h.date, type: labelFromType(h.type) });
+      }
+
+      // ➍ Injecter l’historique JSONBin dans les clients “remote”
+      const remoteWithHistory = (remote || []).map(c => {
+        const key = sanitizePhone(c.telephone);
+        const logs = byPhone.get(key) || [];
+        const prev = Array.isArray(c.messagesEnvoyes) ? c.messagesEnvoyes : [];
+        // fusion simple (évite doublons par (type|date))
+        const seen = new Set(prev.map((m: any) => `${m.type}|${m.date}`));
+        const mergedLogs = [...prev];
+        for (const m of logs) {
+          const id = `${m.type}|${m.date}`;
+          if (!seen.has(id)) mergedLogs.push({ type: m.type as any, date: m.date });
+        }
+        return { ...c, messagesEnvoyes: mergedLogs };
+      });
+
+      // ➎ Merger avec le local
+      const localStr = await AsyncStorage.getItem('clients');
+      const local: Client[] = localStr ? JSON.parse(localStr) : [];
+      const merged = mergeLocalWithServer(local, remoteWithHistory);
+
+      await AsyncStorage.setItem('clients', JSON.stringify(merged));
+      setClients(merged);
+      setFilteredClients(merged);
+    } catch (e: any) {
+      setSyncError(e?.message || 'Erreur inconnue');
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   const toggleSelect = (rawPhone: string) => {
     const phone = sanitizePhone(rawPhone);
@@ -178,6 +417,7 @@ export default function ClientListPage() {
     setFilteredClients(updated);
     setSelectedClients(prev => prev.filter(t => t !== phone));
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
+    // (optionnel) appeler une route DELETE côté serveur si disponible
   };
 
   const resetClientHistory = async (rawPhone: string) => {
@@ -210,7 +450,7 @@ export default function ClientListPage() {
       .replace(/\s+/g, ' ')
       .trim();
 
-  /* --------- Choix type (modale au lieu d'Alert) --------- */
+  /* --------- Choix type (modale) --------- */
   const openSmsDialog = () => {
     if (selectedClients.length === 0) {
       Alert.alert('Info', 'Sélectionne au moins un client.');
@@ -219,12 +459,11 @@ export default function ClientListPage() {
     setTypeModalVisible(true);
   };
 
+  // ✅ n’envoie que si on a un licenceId (le backend n’accepte pas la clé)
   const sendOne = async ({
-    licenceId, cle, phoneNumber, message,
-  }: { licenceId: string | null; cle: string | null; phoneNumber: string; message: string; }) => {
-    const payload: any = { phoneNumber, message };
-    if (licenceId) payload.licenceId = licenceId;
-    if (cle) payload.cle = cle;
+    licenceId, phoneNumber, message,
+  }: { licenceId: string; phoneNumber: string; message: string; }) => {
+    const payload: any = { phoneNumber, message, licenceId };
     const resp = await fetch(SEND_SMS_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -245,18 +484,17 @@ export default function ClientListPage() {
       return;
     }
 
-    const { licenceId, cle } = await getLicenceFromStorage();
-    if (!licenceId && !cle) {
+    const { licenceId: storedId } = await getLicenceFromStorage();
+    const resolvedId = storedId || (await resolveLicenceId());
+    if (!resolvedId) {
       Alert.alert('Erreur', 'Licence introuvable.');
       return;
     }
 
-    if (licenceId) {
-      const credits = await fetchCreditsFromServer(licenceId);
-      if (credits !== null && credits < batch.length) {
-        Alert.alert('Crédits insuffisants', `Crédits: ${credits}, SMS requis: ${batch.length}.`);
-        return;
-      }
+    const credits = await fetchCreditsFromServer(resolvedId);
+    if (credits !== null && credits < batch.length) {
+      Alert.alert('Crédits insuffisants', `Crédits: ${credits}, SMS requis: ${batch.length}.`);
+      return;
     }
 
     const signature = await getSignatureFromSettings();
@@ -291,7 +529,7 @@ export default function ClientListPage() {
         if (!message) { failed++; setProgressCount((x) => x + 1); continue; }
 
         try {
-          await sendOne({ licenceId, cle, phoneNumber: phone, message });
+          await sendOne({ licenceId: resolvedId, phoneNumber: phone, message });
 
           const idx = updated.findIndex((u) => sanitizePhone(u.telephone) === phone);
           if (idx !== -1) {
@@ -382,7 +620,14 @@ export default function ClientListPage() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Clients enregistrés</Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Text style={styles.title}>Clients enregistrés</Text>
+        <TouchableOpacity onPress={syncFromServer} style={styles.syncBtn}>
+          <Text style={styles.syncBtnText}>{syncing ? '…' : '↻ Sync'}</Text>
+        </TouchableOpacity>
+      </View>
+
+      {syncError ? <Text style={styles.syncError}>⚠ {syncError}</Text> : null}
 
       <TouchableOpacity style={styles.homeButton} onPress={() => navigation.navigate('Home')}>
         <Text style={styles.homeButtonText}>← Accueil</Text>
@@ -496,7 +741,7 @@ export default function ClientListPage() {
         </View>
       </Modal>
 
-      {/* Progress */}
+      {/* Progress envoi */}
       <Modal visible={sending} transparent animationType="fade" onRequestClose={() => { if (sendStep !== 'send') setSending(false); }}>
         <View style={styles.modalOverlay}>
           <View style={styles.progressCard}>
@@ -546,7 +791,12 @@ const styles = StyleSheet.create({
   smsButton: { backgroundColor: '#00BFFF', padding: 14, borderRadius: 10, alignItems: 'center' },
   smsText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
 
-  // Custom/modal shared styles
+  // Sync
+  syncBtn: { paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#1f2937', borderRadius: 6 },
+  syncBtnText: { color: '#cdeafe', fontWeight: '600' },
+  syncError: { color: '#ff6b6b', marginTop: 4 },
+
+  // Custom/modal
   customOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)' },
   customCard: { backgroundColor: '#222', padding: 22, borderRadius: 12, width: '85%' },
   customTitle: { color: '#fff', fontWeight: 'bold', fontSize: 16, marginBottom: 6 },
