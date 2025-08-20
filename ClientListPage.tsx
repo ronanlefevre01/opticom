@@ -1,5 +1,5 @@
 // ClientListPage.tsx
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import {
   View, Text, FlatList, TouchableOpacity, StyleSheet,
   TextInput, Modal, ActivityIndicator, Platform, Alert,
@@ -11,6 +11,9 @@ import { NavigationProps } from './navigationTypes';
 import API_BASE from './src/config/api';
 
 const SEND_SMS_ENDPOINT = `${API_BASE}/send-sms`;
+
+// ---------- Anti-spam sync ----------
+const CLIENTS_SYNC_COOLDOWN_MS = 120_000; // 2 minutes
 
 /* ------------ helpers ------------- */
 const sanitizePhone = (raw: string) => {
@@ -283,7 +286,7 @@ export default function ClientListPage() {
 
   const [customMessages, setCustomMessages] = useState<Record<string, string | { title?: string; content: string }>>({});
 
-  // Progress (même look que AddClientPage)
+  // Progress
   const [sending, setSending] = useState(false);
   const [sendStep, setSendStep] = useState<'prep'|'send'|'done'|'error'>('prep');
   const [sendError, setSendError] = useState<string | null>(null);
@@ -294,14 +297,85 @@ export default function ClientListPage() {
   const [customModalVisible, setCustomModalVisible] = useState(false);
   const [customText, setCustomText] = useState('');
 
-  // ✅ modale choix de type
+  // modale choix de type
   const [typeModalVisible, setTypeModalVisible] = useState(false);
 
-  // 🔄 état sync
+  // sync state
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
 
-  // Chargement local + synchro serveur au montage
+  // anti-spam (verrou + cooldown)
+  const lastSyncRef = useRef(0);
+  const inFlightRef = useRef(false);
+
+  const syncFromServer = useCallback(async (force = false) => {
+    if (inFlightRef.current) return; // déjà en cours
+    const now = Date.now();
+    if (!force && now - lastSyncRef.current < CLIENTS_SYNC_COOLDOWN_MS) return;
+
+    inFlightRef.current = true;
+    try {
+      setSyncing(true);
+      setSyncError(null);
+
+      const { licenceId: storedId, cle } = await getLicenceFromStorage();
+      const licenceId = storedId || (await resolveLicenceId());
+      if (!licenceId) {
+        setSyncError('Licence introuvable');
+        return;
+      }
+
+      // 1) Clients
+      const remote = await fetchClientsFromServer(licenceId);
+      if (!remote) {
+        setSyncError('Serveur indisponible');
+        return;
+      }
+
+      // 2) Historique via { licence }.historiqueSms
+      const licenceHistory = await fetchSmsHistoryFromLicence(licenceId, cle);
+
+      // 3) Indexer l’historique par téléphone
+      const byPhone = new Map<string, { date: string; type: string }[]>();
+      for (const h of licenceHistory) {
+        const key = sanitizePhone(h.numero || '');
+        if (!key) continue;
+        if (!byPhone.has(key)) byPhone.set(key, []);
+        byPhone.get(key)!.push({ date: h.date, type: labelFromType(h.type) });
+      }
+
+      // 4) Injecter l’historique serveur dans les clients
+      const remoteWithHistory = (remote || []).map(c => {
+        const key = sanitizePhone(c.telephone);
+        const logs = byPhone.get(key) || [];
+        const prev = Array.isArray(c.messagesEnvoyes) ? c.messagesEnvoyes : [];
+        const seen = new Set(prev.map((m: any) => `${m.type}|${m.date}`));
+        const mergedLogs = [...prev];
+        for (const m of logs) {
+          const id = `${m.type}|${m.date}`;
+          if (!seen.has(id)) mergedLogs.push({ type: m.type as any, date: m.date });
+        }
+        return { ...c, messagesEnvoyes: mergedLogs };
+      });
+
+      // 5) Merger avec le local
+      const localStr = await AsyncStorage.getItem('clients');
+      const local: Client[] = localStr ? JSON.parse(localStr) : [];
+      const merged = mergeLocalWithServer(local, remoteWithHistory);
+
+      await AsyncStorage.setItem('clients', JSON.stringify(merged));
+      setClients(merged);
+      setFilteredClients(merged);
+    } catch (e: any) {
+      setSyncError(e?.message || 'Erreur inconnue');
+    } finally {
+      lastSyncRef.current = Date.now();
+      inFlightRef.current = false;
+      setSyncing(false);
+    }
+  }, []);
+
+  // Chargement local + 1ère synchro forcée au montage
   useEffect(() => {
     const loadData = async () => {
       const clientData = await AsyncStorage.getItem('clients');
@@ -314,11 +388,10 @@ export default function ClientListPage() {
       if (messageData) {
         try { setCustomMessages(JSON.parse(messageData)); } catch {}
       }
-      // Première synchro
-      await syncFromServer();
+      await syncFromServer(true); // <- synchro unique au démarrage
     };
     loadData();
-  }, []);
+  }, [syncFromServer]);
 
   // Filtrage recherche / type
   useEffect(() => {
@@ -337,69 +410,6 @@ export default function ClientListPage() {
     setFilteredClients(result);
   }, [searchQuery, smsFilter, clients]);
 
-  const syncFromServer = async () => {
-    try {
-      setSyncing(true);
-      setSyncError(null);
-
-      const { licenceId: storedId, cle } = await getLicenceFromStorage();
-      const licenceId = storedId || (await resolveLicenceId());
-      if (!licenceId) {
-        setSyncError('Licence introuvable');
-        setSyncing(false);
-        return;
-      }
-
-      // ➊ Clients distants
-      const remote = await fetchClientsFromServer(licenceId);
-      if (!remote) {
-        setSyncError('Serveur indisponible');
-        setSyncing(false);
-        return;
-      }
-
-      // ➋ Historique côté licence (JSONBin)
-      const licenceHistory = await fetchSmsHistoryFromLicence(licenceId, cle);
-
-      // ➌ Indexer l’historique par téléphone (sanitisé)
-      const byPhone = new Map<string, { date: string; type: string }[]>();
-      for (const h of licenceHistory) {
-        const key = sanitizePhone(h.numero || '');
-        if (!key) continue;
-        if (!byPhone.has(key)) byPhone.set(key, []);
-        byPhone.get(key)!.push({ date: h.date, type: labelFromType(h.type) });
-      }
-
-      // ➍ Injecter l’historique JSONBin dans les clients “remote”
-      const remoteWithHistory = (remote || []).map(c => {
-        const key = sanitizePhone(c.telephone);
-        const logs = byPhone.get(key) || [];
-        const prev = Array.isArray(c.messagesEnvoyes) ? c.messagesEnvoyes : [];
-        // fusion simple (évite doublons par (type|date))
-        const seen = new Set(prev.map((m: any) => `${m.type}|${m.date}`));
-        const mergedLogs = [...prev];
-        for (const m of logs) {
-          const id = `${m.type}|${m.date}`;
-          if (!seen.has(id)) mergedLogs.push({ type: m.type as any, date: m.date });
-        }
-        return { ...c, messagesEnvoyes: mergedLogs };
-      });
-
-      // ➎ Merger avec le local
-      const localStr = await AsyncStorage.getItem('clients');
-      const local: Client[] = localStr ? JSON.parse(localStr) : [];
-      const merged = mergeLocalWithServer(local, remoteWithHistory);
-
-      await AsyncStorage.setItem('clients', JSON.stringify(merged));
-      setClients(merged);
-      setFilteredClients(merged);
-    } catch (e: any) {
-      setSyncError(e?.message || 'Erreur inconnue');
-    } finally {
-      setSyncing(false);
-    }
-  };
-
   const toggleSelect = (rawPhone: string) => {
     const phone = sanitizePhone(rawPhone);
     setSelectedClients((prev) =>
@@ -417,7 +427,6 @@ export default function ClientListPage() {
     setFilteredClients(updated);
     setSelectedClients(prev => prev.filter(t => t !== phone));
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
-    // (optionnel) appeler une route DELETE côté serveur si disponible
   };
 
   const resetClientHistory = async (rawPhone: string) => {
@@ -459,7 +468,7 @@ export default function ClientListPage() {
     setTypeModalVisible(true);
   };
 
-  // ✅ n’envoie que si on a un licenceId (le backend n’accepte pas la clé)
+  // n’envoie que si on a un licenceId (le backend n’accepte pas la clé)
   const sendOne = async ({
     licenceId, phoneNumber, message,
   }: { licenceId: string; phoneNumber: string; message: string; }) => {
@@ -622,7 +631,7 @@ export default function ClientListPage() {
     <View style={styles.container}>
       <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
         <Text style={styles.title}>Clients enregistrés</Text>
-        <TouchableOpacity onPress={syncFromServer} style={styles.syncBtn}>
+        <TouchableOpacity onPress={() => syncFromServer(true)} style={styles.syncBtn} disabled={syncing}>
           <Text style={styles.syncBtnText}>{syncing ? '…' : '↻ Sync'}</Text>
         </TouchableOpacity>
       </View>
