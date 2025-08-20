@@ -294,71 +294,71 @@ async function resolveLicenceIdFromCle(cle?: string): Promise<string | null> {
 }
 
 // 2) petit POST JSON strict (remonte les vrais messages d’erreur)
-async function postJsonStrict(url: string, body: any) {
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+const postJson = async (url: string, body: any) => {
+  const r = await fetch(url, {
+    method: 'POST',                      // <-- POST (pas PUT)
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const txt = await resp.text();
-  let data: any = null;
-  try { data = txt ? JSON.parse(txt) : null; } catch { /* noop */ }
-  if (!resp.ok || data?.success === false || data?.ok === false) {
-    const msg = (data && (data.error || data.message)) || `HTTP ${resp.status}`;
-    throw new Error(String(msg));
+  const j = await r.json().catch(() => ({} as any));
+  if (!r.ok || j?.ok === false) throw new Error(j?.error || `HTTP ${r.status}`);
+  return j;
+};
+
+const saveSenderRemote = useCallback(async (normalized: string) => {
+  if (!licenceId) return false;
+  const payload = { licenceId, libelleExpediteur: normalized };
+
+  try {
+    // 1) route principale
+    const j = await postJson(`${SERVER_BASE}/licence/expediteur`, payload);
+    if (j?.licence) {
+      setLicence(j.licence);
+      await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+    }
+    return true;
+  } catch (e1) {
+    // 2) fallback éventuel
+    try {
+      const j = await postJson(`${SERVER_BASE}/api/licence/expediteur`, payload);
+      if (j?.licence) {
+        setLicence(j.licence);
+        await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+      }
+      return true;
+    } catch (e2) {
+      console.warn('saveSenderRemote error:', e2);
+      return false;
+    }
   }
-  return data;
-}
+}, [licenceId]);
 
-// 3) saveSenderRemote — envoie TOUJOURS un vrai licenceId
-const saveSenderRemote = useCallback(
-  async (normalized: string) => {
+const saveSignatureRemote = useCallback(async (sig: string) => {
+  if (!licenceId) return false;
+  const payload = { licenceId, signature: sig };
+
+  try {
+    const j = await postJson(`${SERVER_BASE}/licence/signature`, payload);
+    if (j?.licence) {
+      setLicence(j.licence);
+      await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+    }
+    return true;
+  } catch (e1) {
     try {
-      let id = licenceId?.trim();
-      if (!id) id = await resolveLicenceIdFromCle(cleLicence);
-      if (!id) throw new Error("Impossible d'identifier la licence (id/clé manquants)");
-
-      const payload = { licenceId: id, libelleExpediteur: normalized };
-      const j = await postJsonStrict(`${SERVER_BASE}/licence/expediteur`, payload);
-
+      const j = await postJson(`${SERVER_BASE}/api/licence/signature`, payload);
       if (j?.licence) {
         setLicence(j.licence);
         await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
       }
       return true;
-    } catch (e: any) {
-      console.warn('saveSenderRemote error:', e?.message || e);
-      Alert.alert('Erreur', `Sauvegarde du libellé impossible : ${e?.message || 'inconnue'}`);
+    } catch (e2) {
+      console.warn('saveSignatureRemote error:', e2);
       return false;
     }
-  },
-  [licenceId, cleLicence]
-);
+  }
+}, [licenceId]);
 
-// 4) saveSignatureRemote — idem, envoie l’ID résolu si besoin
-const saveSignatureRemote = useCallback(
-  async (sig: string) => {
-    try {
-      let id = licenceId?.trim();
-      if (!id) id = await resolveLicenceIdFromCle(cleLicence);
-      if (!id) throw new Error("Impossible d'identifier la licence (id/clé manquants)");
-
-      const payload = { licenceId: id, signature: sig };
-      const j = await postJsonStrict(`${SERVER_BASE}/licence/signature`, payload);
-
-      if (j?.licence) {
-        setLicence(j.licence);
-        await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
-      }
-      return true;
-    } catch (e: any) {
-      console.warn('saveSignatureRemote error:', e?.message || e);
-      Alert.alert('Erreur', `Sauvegarde de la signature impossible : ${e?.message || 'inconnue'}`);
-      return false;
-    }
-  },
-  [licenceId, cleLicence]
-);
 
 // 5) handleSaveBasics — met à jour local, push serveur, puis REFETCH avec cache-buster
 const handleSaveBasics = async () => {
