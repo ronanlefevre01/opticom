@@ -277,55 +277,76 @@ export default function SettingsPage() {
   }, [cleLicence, licenceId, messages]);
 
   // ------ Save expéditeur / signature (POST vers /licence/*) ------
-  const saveSenderRemote = useCallback(
-    async (normalized: string) => {
-      if (!licenceId) return false;
-      try {
-        const r = await fetch(`${SERVER_BASE}/licence/expediteur`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ licenceId, libelleExpediteur: normalized }),
-        });
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
-        if (j?.licence) {
-          setLicence(j.licence);
-          await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
-        }
-        return true;
-      } catch (e) {
-        console.warn('saveSenderRemote error:', e);
-        return false;
-      }
-    },
-    [licenceId]
-  );
+  // helper: fallback to resolve licenceId from key when needed
+async function resolveLicenceIdFromCle(cle?: string): Promise<string | null> {
+  if (!cle) return null;
+  try {
+    const r = await fetch(`${SERVER_BASE}/api/licence?cle=${encodeURIComponent(cle)}`, {
+      headers: { Accept: 'application/json' },
+    });
+    const j = await r.json();
+    const lic = j?.licence ?? j;
+    return lic?.id ? String(lic.id) : null;
+  } catch {
+    return null;
+  }
+}
+const saveSenderRemote = useCallback(
+  async (normalized: string) => {
+    try {
+      let id = licenceId;
+      if (!id) id = await resolveLicenceIdFromCle(cleLicence);
+      if (!id) throw new Error('LICENCE_ID_MISSING');
 
-  const saveSignatureRemote = useCallback(
-    async (sig: string) => {
-      if (!licenceId) return false;
-      try {
-        const r = await fetch(`${SERVER_BASE}/licence/signature`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ licenceId, signature: sig }),
-        });
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
-        if (j?.licence) {
-          setLicence(j.licence);
-          await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
-        }
-        return true;
-      } catch (e) {
-        console.warn('saveSignatureRemote error:', e);
-        return false;
-      }
-    },
-    [licenceId]
-  );
+      const r = await fetch(`${SERVER_BASE}/licence/expediteur`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ licenceId: id, libelleExpediteur: normalized }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j?.success === false) throw new Error(j?.error || `HTTP ${r.status}`);
 
-  const handleSaveBasics = async () => {
+      if (j?.licence) {
+        setLicence(j.licence);
+        await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+      }
+      return true;
+    } catch (e: any) {
+      console.warn('saveSenderRemote error:', e?.message || e);
+      return false;
+    }
+  },
+  [licenceId, cleLicence]
+);
+
+const saveSignatureRemote = useCallback(
+  async (sig: string) => {
+    try {
+      let id = licenceId;
+      if (!id) id = await resolveLicenceIdFromCle(cleLicence);
+      if (!id) throw new Error('LICENCE_ID_MISSING');
+
+      const r = await fetch(`${SERVER_BASE}/licence/signature`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ licenceId: id, signature: sig }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j?.success === false) throw new Error(j?.error || `HTTP ${r.status}`);
+
+      if (j?.licence) {
+        setLicence(j.licence);
+        await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+      }
+      return true;
+    } catch (e: any) {
+      console.warn('saveSignatureRemote error:', e?.message || e);
+      return false;
+    }
+  },
+  [licenceId, cleLicence]
+);
+const handleSaveBasics = async () => {
   try {
     const normalized = normalizeSender(expediteurRaw);
     if (normalized.length < 3) {
@@ -333,7 +354,7 @@ export default function SettingsPage() {
       return;
     }
 
-    // 1) Met à jour local immédiatement
+    // 1) local first
     await AsyncStorage.setItem('signature', signature);
     if (licence) {
       const updated = { ...licence, libelleExpediteur: normalized, signature };
@@ -342,19 +363,19 @@ export default function SettingsPage() {
     }
     setExpediteurRaw(normalized);
 
-    // 2) Push serveur (concurrent)
+    // 2) push server
     const [okSender, okSig] = await Promise.all([
       saveSenderRemote(normalized),
       saveSignatureRemote(signature),
     ]);
 
+    // 3) refetch fresh (cache-buster)
     if (okSender || okSig) {
-      // 3) Refetch FRAIS avec cache-buster pour éviter le stale
       try {
         const sp = new URLSearchParams();
         if (cleLicence) sp.set('cle', cleLicence);
         if (licenceId)  sp.set('id', licenceId);
-        sp.set('_', String(Date.now())); // <- anti-cache
+        sp.set('_', String(Date.now()));
         const url = `${SERVER_BASE}/api/licence?${sp.toString()}`;
 
         const resp = await fetch(url, { headers: { Accept: 'application/json' } });
@@ -366,8 +387,7 @@ export default function SettingsPage() {
             setLicence(fresh);
             await AsyncStorage.setItem('licence', JSON.stringify(fresh));
 
-            const sender =
-              fresh.libelleExpediteur || fresh.opticien?.enseigne || fresh.nom || 'OptiCOM';
+            const sender = fresh.libelleExpediteur || fresh.opticien?.enseigne || fresh.nom || 'OptiCOM';
             setExpediteurRaw(String(sender));
 
             if (typeof fresh.signature === 'string') {
@@ -376,10 +396,7 @@ export default function SettingsPage() {
             }
           }
         }
-      } catch {
-        // si le refetch échoue, on garde l'état local déjà mis à jour
-      }
-
+      } catch {/* keep local state if refetch fails */}
       Alert.alert('Paramètres', 'Enregistrés avec succès.');
     } else {
       Alert.alert('Paramètres', 'Enregistré localement. (Serveur indisponible)');
@@ -388,6 +405,7 @@ export default function SettingsPage() {
     Alert.alert('Erreur', 'Impossible de sauvegarder les paramètres.');
   }
 };
+
 
 
   // ------ Automatisations ------
