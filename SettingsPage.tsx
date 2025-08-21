@@ -6,10 +6,13 @@ import {
   TouchableOpacity, Alert, ScrollView, Linking, Switch,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useNavigation, CommonActions } from '@react-navigation/native';
+import { useNavigation, CommonActions, useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 
 const SERVER_BASE = 'https://opticom-sms-server.onrender.com';
+
+// --- Route racine de l’écran de connexion/licence ---
+const LICENCE_ROUTE_NAME = 'licencechackpage';
 
 // --- URLs légales ---
 const MENTIONS_URL = `${SERVER_BASE}/legal/mentions.md`;
@@ -70,6 +73,24 @@ async function getJSON(url: string) {
 export default function SettingsPage() {
   const navigation = useNavigation<any>();
 
+  // --- Helper pour RESET au niveau du NAVIGATEUR RACINE ---
+  const resetToLicenceCheck = useCallback(() => {
+    // Remonter jusqu’au parent le plus haut
+    // afin de reset *toute* la navigation (même si Settings est dans un onglet)
+    let nav: any = navigation;
+    let parent = nav?.getParent?.();
+    while (parent) {
+      nav = parent;
+      parent = nav.getParent?.();
+    }
+    nav?.dispatch(
+      CommonActions.reset({
+        index: 0,
+        routes: [{ name: LICENCE_ROUTE_NAME }],
+      })
+    );
+  }, [navigation]);
+
   const [licence, setLicence] = useState<any>(null);
   const [expediteurRaw, setExpediteurRaw] = useState('');
   const [signature, setSignature] = useState('');
@@ -90,7 +111,7 @@ export default function SettingsPage() {
 
   const expediteurNormalized = useMemo(() => normalizeSender(expediteurRaw), [expediteurRaw]);
 
-  // IDs dérivés (peuvent être vides si non connectés)
+  // IDs dérivés
   const cleLicence = String(licence?.licence || '').trim();
   const licenceId  = String(licence?.id || '').trim();
   const opticienId = String(licence?.opticien?.id || '').trim() || undefined;
@@ -124,6 +145,20 @@ export default function SettingsPage() {
     }
     return j;
   };
+
+  // -------- Garde: si pas de licence => redirection immédiate vers LicenceCheck --------
+  useFocusEffect(
+    useCallback(() => {
+      let stopped = false;
+      (async () => {
+        const stored = safeParseJSON<any>(await AsyncStorage.getItem('licence'));
+        if (!stopped && (!stored?.id && !stored?.licence)) {
+          resetToLicenceCheck();
+        }
+      })();
+      return () => { stopped = true; };
+    }, [resetToLicenceCheck])
+  );
 
   // -------- chargement local + 1er sync --------
   useEffect(() => {
@@ -221,6 +256,7 @@ export default function SettingsPage() {
 
   // --- Sync licence + prefs + templates ---
   const syncFromServer = useCallback(async (initial = false) => {
+    // si aucune info locale, inutile d’appeler
     if (!cleLicence && !licenceId) return;
     try {
       setSyncing(true); setSyncError(null);
@@ -416,13 +452,12 @@ export default function SettingsPage() {
   const handleReturnHome = () => { navigation.navigate('Home' as never); };
 
   const handleGoToLicence = () => {
-    navigation.dispatch(
-      CommonActions.reset({ index: 0, routes: [{ name: 'licencechackpage' }] })
-    );
+    resetToLicenceCheck();
   };
 
   const handleLogout = async () => {
     try {
+      // Nettoyage stockage
       await AsyncStorage.multiRemove([
         'licence',
         'licence.key',
@@ -434,15 +469,19 @@ export default function SettingsPage() {
         'autoLensMessage',
         'lensAdvanceDays',
       ]);
-      // vider l'état local
+
+      // Vider l'état local + fermer la modale
+      setShowLogoutModal(false);
       setLicence(null);
       setExpediteurRaw('');
       setSignature('');
       setMessages({});
 
-      navigation.dispatch(
-        CommonActions.reset({ index: 0, routes: [{ name: 'licencechackpage' }] })
-      );
+      // Laisser une micro-tick au rendu pour éviter un flash
+      await new Promise(r => setTimeout(r, 0));
+
+      // Reset de *toute* la navigation vers l’écran de licence
+      resetToLicenceCheck();
     } catch {
       Alert.alert('Erreur', 'Impossible de se déconnecter.');
     }

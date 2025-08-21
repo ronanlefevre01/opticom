@@ -1,39 +1,38 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Client } from './types';
 import {
-  Text,
-  TextInput,
-  TouchableOpacity,
-  ScrollView,
-  StyleSheet,
-  Modal,
-  View,
-  ActivityIndicator,
-  Platform,
-  Alert,
+  Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, Modal, View,
+  ActivityIndicator, Platform, Alert
 } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
+import type { Client } from './types';
 
 /* =========================
- * Helpers
+ * Constantes & helpers
  * ========================= */
 
 const SERVER_BASE = 'https://opticom-sms-server.onrender.com';
 
-const sanitizePhone = (raw: string) => {
+const sanitizePhone = (raw: string): string => {
   let p = (raw || '').replace(/[^\d+]/g, '');
   if (p.startsWith('+33')) p = '0' + p.slice(3);
   return p.replace(/\D/g, '');
 };
 const isPhone10 = (p: string) => /^\d{10}$/.test(p);
 
+const DEFAULT_TEMPLATES: Record<'Lunettes' | 'SAV' | 'Lentilles' | 'Commande', string> = {
+  Lunettes:  'Bonjour {prenom} {nom}, vos lunettes sont prêtes. À bientôt !',
+  SAV:       'Bonjour {prenom} {nom}, votre SAV est terminé, vous pouvez venir le récupérer.',
+  Lentilles: 'Bonjour {prenom} {nom}, vos lentilles sont disponibles en magasin.',
+  Commande:  'Bonjour {prenom} {nom}, votre commande est arrivée !',
+};
+
 const getSignatureFromSettings = async (): Promise<string> => {
   try {
     const licStr = await AsyncStorage.getItem('licence');
     if (licStr) {
       const lic = JSON.parse(licStr);
-      if (typeof lic?.signature === 'string' && lic.signature.trim().length > 0) {
+      if (typeof lic?.signature === 'string' && lic.signature.trim()) {
         return lic.signature.trim();
       }
     }
@@ -55,29 +54,40 @@ const appendSignature = (msg: string, sig: string) => {
   return `${m}${sep}${s}`;
 };
 
-/** Modèles par défaut */
-const DEFAULT_TEMPLATES: Record<string, string> = {
-  Lunettes:  'Bonjour {prenom} {nom}, vos lunettes sont prêtes. À bientôt !',
-  SAV:       'Bonjour {prenom} {nom}, votre SAV est terminé, vous pouvez venir le récupérer.',
-  Lentilles: 'Bonjour {prenom} {nom}, vos lentilles sont disponibles en magasin.',
-  Commande:  'Bonjour {prenom} {nom}, votre commande est arrivée !',
-};
-
-/** Récupère (ou résout) le licenceId à partir d’AsyncStorage */
-const getLicenceId = async (): Promise<string | null> => {
+/** Récupère (ou résout) un licenceId stable et le *cache* */
+const getStableLicenceId = async (): Promise<string | null> => {
   try {
+    // 1) cache direct
+    const cached = await AsyncStorage.getItem('licenceId');
+    if (cached) return cached;
+
+    // 2) objet de licence complet
     const licStr = await AsyncStorage.getItem('licence');
     if (!licStr) return null;
     const lic = JSON.parse(licStr);
-    if (lic?.id) return String(lic.id);
+
+    if (lic?.id) {
+      await AsyncStorage.setItem('licenceId', String(lic.id));
+      return String(lic.id);
+    }
     if (lic?.licence) {
-      const r = await fetch(`${SERVER_BASE}/api/licence/by-key?key=${encodeURIComponent(lic.licence)}`);
+      // Le serveur accepte ?key= ou ?cle=
+      const r = await fetch(
+        `${SERVER_BASE}/api/licence/by-key?key=${encodeURIComponent(lic.licence)}`,
+        { headers: { Accept: 'application/json' } }
+      );
       if (r.ok) {
-        const { licence } = await r.json();
-        return String(licence.id);
+        const j = await r.json().catch(() => ({} as any));
+        const id = j?.licence?.id || j?.id;
+        if (id) {
+          await AsyncStorage.setItem('licenceId', String(id));
+          return String(id);
+        }
       }
     }
-  } catch {}
+  } catch {
+    // ignore
+  }
   return null;
 };
 
@@ -97,7 +107,7 @@ const toServerClient = (local: any, stableId?: string) => {
     nom: String(local.nom || ''),
     phone: sanitizePhone(local.telephone || ''),
     email: String(local.email || ''),
-    naissance: local.dateNaissance || null,   // JJ/MM/AAAA accepté
+    naissance: local.dateNaissance || null,   // JJ/MM/AAAA
     lensStartDate: null,
     lensEndDate: null,
     lensDuration,
@@ -110,26 +120,24 @@ const toServerClient = (local: any, stableId?: string) => {
  * Page
  * ========================= */
 
-type RouteParams = {
-  mode?: 'edit' | 'new';
-  client?: Client;
-};
+type RouteParams = { mode?: 'edit' | 'new'; client?: Client };
 
 export default function AddClientPage() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
   const { mode, client }: RouteParams = route.params || {};
 
+  // Identité
   const [nom, setNom] = useState('');
   const [prenom, setPrenom] = useState('');
   const [telephone, setTelephone] = useState('');
   const [email, setEmail] = useState('');
 
   // Date de naissance (JJ/MM/AAAA via 3 menus)
-  const [dateNaissance, setDateNaissance] = useState('');
-  const [bDay, setBDay] = useState<string>('');
-  const [bMonth, setBMonth] = useState<string>('');
-  const [bYear, setBYear] = useState<string>('');
+  const [bDay, setBDay] = useState('');
+  const [bMonth, setBMonth] = useState('');
+  const [bYear, setBYear] = useState('');
+  const dateNaissance = useMemo(() => (bDay && bMonth && bYear ? `${bDay}/${bMonth}/${bYear}` : ''), [bDay, bMonth, bYear]);
   const [pickerOpen, setPickerOpen] = useState<null | 'day' | 'month' | 'year'>(null);
 
   // Produits
@@ -153,89 +161,82 @@ export default function AddClientPage() {
   const [customText, setCustomText] = useState('');
 
   // Toast
-  const [toast, setToast] = useState<{visible: boolean; text: string}>({visible: false, text: ''});
-  const showToast = (text: string, ms = 1500) => {
+  const [toast, setToast] = useState<{ visible: boolean; text: string }>({ visible: false, text: '' });
+  const showToast = useCallback((text: string, ms = 1500) => {
     setToast({ visible: true, text });
     setTimeout(() => setToast({ visible: false, text: '' }), ms);
-  };
+  }, []);
 
   // Progress envoi SMS
   const [sending, setSending] = useState(false);
-  const [sendStep, setSendStep] = useState<'prep'|'send'|'done'|'error'>('prep');
+  const [sendStep, setSendStep] = useState<'prep' | 'send' | 'done' | 'error'>('prep');
   const [sendError, setSendError] = useState<string | null>(null);
 
   // Options date
-  const dayOptions = Array.from({ length: 31 }, (_, i) => {
-    const v = String(i + 1).padStart(2, '0');
-    return { value: v, label: v };
-  });
-  const monthOptions = [
-    ['01','Jan.'],['02','Fév.'],['03','Mars'],['04','Avr.'],['05','Mai'],['06','Juin'],
-    ['07','Juil.'],['08','Août'],['09','Sept.'],['10','Oct.'],['11','Nov.'],['12','Déc.'],
-  ].map(([v,l]) => ({ value: v, label: `${v} — ${l}` }));
-  const currentYear = new Date().getFullYear();
-  const yearOptions = Array.from({ length: currentYear - 1900 + 1 }, (_, i) => {
-    const y = String(currentYear - i);
-    return { value: y, label: y };
-  });
+  const dayOptions = useMemo(
+    () => Array.from({ length: 31 }, (_, i) => {
+      const v = String(i + 1).padStart(2, '0');
+      return { value: v, label: v };
+    }),
+    []
+  );
+  const monthOptions = useMemo(
+    () => ([
+      ['01', 'Jan.'], ['02', 'Fév.'], ['03', 'Mars'], ['04', 'Avr.'], ['05', 'Mai'], ['06', 'Juin'],
+      ['07', 'Juil.'], ['08', 'Août'], ['09', 'Sept.'], ['10', 'Oct.'], ['11', 'Nov.'], ['12', 'Déc.'],
+    ] as const).map(([v, l]) => ({ value: v, label: `${v} — ${l}` })),
+    []
+  );
+  const yearOptions = useMemo(() => {
+    const currentYear = new Date().getFullYear();
+    return Array.from({ length: currentYear - 1900 + 1 }, (_, i) => {
+      const y = String(currentYear - i);
+      return { value: y, label: y };
+    });
+  }, []);
 
-  const syncBirthdate = (d = bDay, m = bMonth, y = bYear) => {
-    if (d && m && y) setDateNaissance(`${d}/${m}/${y}`);
-    else setDateNaissance('');
-  };
-
+  // Pré-remplissage en mode édition + chargement modèles
   useEffect(() => {
     if (mode === 'edit' && client) {
-      const c = client as any;
+      const c: any = client;
 
       setNom(String(c.nom || ''));
       setPrenom(String(c.prenom || ''));
       setTelephone(String(c.telephone || ''));
       setEmail(String(c.email || ''));
 
-      // parse date existante
       const dn = String(c.dateNaissance || '');
       const mt = dn.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
       if (mt) {
-        const d = mt[1].padStart(2, '0');
-        const m = mt[2].padStart(2, '0');
-        const y = mt[3];
-        setBDay(d); setBMonth(m); setBYear(y);
-        setDateNaissance(`${d}/${m}/${y}`);
+        setBDay(mt[1].padStart(2, '0'));
+        setBMonth(mt[2].padStart(2, '0'));
+        setBYear(mt[3]);
       } else {
-        setBDay(''); setBMonth(''); setBYear(''); setDateNaissance('');
+        setBDay(''); setBMonth(''); setBYear('');
       }
 
       setLunettes(!!c.lunettes);
-
-      const arr = Array.isArray(c.lentilles) ? c.lentilles : [];
+      const arr: string[] = Array.isArray(c.lentilles) ? c.lentilles : [];
       setJourn30(arr.includes('30j'));
       setJourn60(arr.includes('60j'));
       setJourn90(arr.includes('90j'));
       setMens6(arr.includes('6mois'));
       setMens12(arr.includes('1an'));
 
-      const serviceFromObj = !!c?.consent?.service_sms?.value;
-      const marketingFromObj = !!c?.consent?.marketing_sms?.value;
-      setConsentService(serviceFromObj);
-      setConsentMarketing(marketingFromObj || !!c.consentementMarketing);
+      setConsentService(!!c?.consent?.service_sms?.value);
+      setConsentMarketing(!!c?.consent?.marketing_sms?.value || !!c.consentementMarketing);
     }
 
-    // Charger modèles
     AsyncStorage.getItem('messages').then((data) => {
       if (!data) return;
-      try {
-        const parsed = JSON.parse(data);
-        setMessages(parsed);
-      } catch {}
+      try { setMessages(JSON.parse(data)); } catch {}
     });
   }, [mode, client]);
 
-  const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>, value: boolean) =>
-    setter(!value);
+  const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>, value: boolean) => setter(!value);
 
   /** SAVE + SYNC SERVEUR */
-  const handleSave = async () => {
+  const handleSave = useCallback(async () => {
     const tel = sanitizePhone(telephone.trim());
     if (!tel) return showToast('☎ Numéro obligatoire');
     if (!isPhone10(tel)) return showToast('❌ Numéro invalide');
@@ -252,13 +253,7 @@ export default function AddClientPage() {
       email,
       dateNaissance, // JJ/MM/AAAA
       lunettes,
-      lentilles: [
-        journ30 ? '30j' : null,
-        journ60 ? '60j' : null,
-        journ90 ? '90j' : null,
-        mens6 ? '6mois' : null,
-        mens12 ? '1an' : null,
-      ].filter(Boolean),
+      lentilles: [journ30 && '30j', journ60 && '60j', journ90 && '90j', mens6 && '6mois', mens12 && '1an'].filter(Boolean),
       consentementMarketing: consentMarketing,
       consent: {
         service_sms: {
@@ -292,26 +287,23 @@ export default function AddClientPage() {
       if (idxExisting >= 0) {
         clients[idxExisting] = { ...clients[idxExisting], ...localClient };
       } else {
-        // si pas d'id stable, on en crée un temporaire
         localClient.id = localClient.id || `c-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
         clients.push(localClient);
       }
-
       await AsyncStorage.setItem('clients', JSON.stringify(clients));
       showToast('💾 Client enregistré (local)');
     } catch (error) {
       console.error('Erreur de sauvegarde locale :', error);
-      showToast('❌ Échec sauvegarde locale');
+      return showToast('❌ Échec sauvegarde locale');
     }
 
     // 3) Push serveur (synchro inter-postes)
     try {
-      const licenceId = await getLicenceId();
+      const licenceId = await getStableLicenceId();
       if (!licenceId) {
         console.warn('LicenceId introuvable → pas de synchro serveur');
         return;
       }
-
       const serverClient = toServerClient(
         { ...localClient, journ30, journ60, journ90, mens6, mens12 },
         localClient.id
@@ -324,30 +316,32 @@ export default function AddClientPage() {
       });
 
       if (!resp.ok) {
-        const t = await resp.text();
+        const t = await resp.text().catch(() => '');
         console.error('Push serveur KO:', resp.status, t);
-        showToast('⚠️ Synchro serveur échouée');
-        return;
+        return showToast('⚠️ Synchro serveur échouée');
       }
 
       // 4) Met à jour l’entrée locale avec l’id/updatedAt final
-      const data = await AsyncStorage.getItem('clients');
-      let clients: any[] = data ? JSON.parse(data) : [];
-      const j = clients.findIndex(
+      const data2 = await AsyncStorage.getItem('clients');
+      let clients2: any[] = data2 ? JSON.parse(data2) : [];
+      const j = clients2.findIndex(
         (c) => (localClient.id && c.id === localClient.id) || sanitizePhone(c.telephone) === tel
       );
       if (j >= 0) {
-        clients[j].id = serverClient.id;
-        clients[j].updatedAt = serverClient.updatedAt;
-        await AsyncStorage.setItem('clients', JSON.stringify(clients));
+        clients2[j].id = serverClient.id;
+        clients2[j].updatedAt = serverClient.updatedAt;
+        await AsyncStorage.setItem('clients', JSON.stringify(clients2));
       }
-
       showToast('☁️ Synchro serveur OK');
     } catch (e) {
       console.error('Synchro serveur erreur:', e);
       showToast('⚠️ Pas de réseau / synchro différée');
     }
-  };
+  }, [
+    telephone, nom, prenom, email, dateNaissance,
+    lunettes, journ30, journ60, journ90, mens6, mens12,
+    consentMarketing, consentService, client, mode, showToast
+  ]);
 
   /* =========================
    * Envoi SMS (transactionnel)
@@ -357,21 +351,18 @@ export default function AddClientPage() {
     let msg = template || 'Bonjour, votre opticien vous contacte.';
     if (prenom) msg = msg.replace('{prenom}', prenom);
     if (nom) msg = msg.replace('{nom}', nom);
-    msg = msg.replace(/\s*\{prenom\}\s*/g, '').replace(/\s*\{nom\}\s*/g, '').replace(/\s+/g, ' ').trim();
-    return msg;
+    return msg.replace(/\s*\{prenom\}\s*/g, '').replace(/\s*\{nom\}\s*/g, '').replace(/\s+/g, ' ').trim();
   };
 
-  const sendTransactionalSMS = async (phone: string, body: string) => {
+  const sendTransactionalSMS = useCallback(async (phone: string, body: string) => {
     const phoneNumber = sanitizePhone(phone);
     if (!isPhone10(phoneNumber)) { showToast('❌ Numéro invalide'); return false; }
     const message = (body || '').trim();
     if (!message) { showToast('❌ Message vide'); return false; }
 
-    // récupère licenceId de façon fiable
-    const licenceId = await getLicenceId();
+    const licenceId = await getStableLicenceId();
     if (!licenceId) { showToast('❌ Licence introuvable'); return false; }
 
-    // Progress
     setSending(true);
     setSendError(null);
     setSendStep('prep');
@@ -403,9 +394,9 @@ export default function AddClientPage() {
       setSendStep('error');
       return false;
     }
-  };
+  }, [showToast]);
 
-  const logMessageSend = async (templateKey: string) => {
+  const logMessageSend = useCallback(async (templateKey: string) => {
     try {
       const data = await AsyncStorage.getItem('clients');
       let clients: any[] = data ? JSON.parse(data) : [];
@@ -419,28 +410,26 @@ export default function AddClientPage() {
         clients[idx].messagesEnvoyes.push({ type: templateKey, date: iso });
         await AsyncStorage.setItem('clients', JSON.stringify(clients));
       }
-    } catch {}
-  };
+    } catch {
+      // ignore
+    }
+  }, [telephone]);
 
-  const sendTemplate = async (templateKey: 'Lunettes'|'SAV'|'Lentilles'|'Commande') => {
-    const fromStore = messages[templateKey]?.content;
-    const template = fromStore && typeof fromStore === 'string'
-      ? fromStore
-      : DEFAULT_TEMPLATES[templateKey];
-
+  const sendTemplate = useCallback(async (templateKey: 'Lunettes' | 'SAV' | 'Lentilles' | 'Commande') => {
     if (!consentService) {
       showToast('⛔ Consentement Service requis');
       return;
     }
-
+    const fromStore = messages[templateKey]?.content;
+    const template = fromStore && typeof fromStore === 'string' ? fromStore : DEFAULT_TEMPLATES[templateKey];
     const sig = await getSignatureFromSettings();
     const finalMessage = appendSignature(buildMessageFromTemplate(template), sig);
 
     const ok = await sendTransactionalSMS(telephone.trim(), finalMessage);
     if (ok) await logMessageSend(templateKey);
-  };
+  }, [messages, consentService, telephone, buildMessageFromTemplate, sendTransactionalSMS, logMessageSend, showToast]);
 
-  const sendCustom = async () => {
+  const sendCustom = useCallback(async () => {
     if (!consentService) {
       showToast('⛔ Consentement Service requis');
       return;
@@ -448,38 +437,32 @@ export default function AddClientPage() {
     const sig = await getSignatureFromSettings();
     const finalMessage = appendSignature(buildMessageFromTemplate(customText), sig);
 
-    // montrer la progression immédiatement
     setSending(true);
     setSendStep('prep');
     setSendError(null);
 
     const ok = await sendTransactionalSMS(telephone.trim(), finalMessage);
     if (ok) {
-      await logMessageSend('Personnalisé' as any);
+      await logMessageSend('Personnalisé');
       setShowCustomModal(false);
     }
-  };
+  }, [consentService, customText, telephone, buildMessageFromTemplate, sendTransactionalSMS, logMessageSend, showToast]);
 
-  const handleExpressSMS = () => {
-    // ✅ Alerte si consentement Service non coché
+  const handleExpressSMS = useCallback(() => {
     if (!consentService) {
-      Alert.alert(
-        'Consentement requis',
-        'Activez “Service (commande prête, SAV…)” pour envoyer un SMS.'
-      );
+      Alert.alert('Consentement requis', 'Activez “Service (commande prête, SAV…)” pour envoyer un SMS.');
       return;
     }
     const tel = sanitizePhone(telephone.trim());
     if (!tel) return showToast('☎ Veuillez saisir un numéro');
     if (!isPhone10(tel)) return showToast('❌ Téléphone invalide');
     setShowSMSModal(true);
-  };
+  }, [consentService, telephone, showToast]);
 
   /* =========================
    * UI
    * ========================= */
 
-  // liste pour la modale de sélection (jour/mois/année)
   const pickerList =
     pickerOpen === 'day' ? dayOptions :
     pickerOpen === 'month' ? monthOptions :
@@ -498,7 +481,7 @@ export default function AddClientPage() {
       />
 
       <TouchableOpacity style={styles.smsButton} onPress={handleExpressSMS}>
-        <Text style={styles.buttonText}>📤 Envoi express cocher la case de consentement service</Text>
+        <Text style={styles.buttonText}>📤 Envoi express (cocher “Service”)</Text>
       </TouchableOpacity>
 
       <Text style={styles.label}>Nom</Text>
@@ -531,14 +514,10 @@ export default function AddClientPage() {
       {/* Consentements */}
       <Text style={[styles.subLabel, { marginTop: 20 }]}>Consentements SMS</Text>
       <TouchableOpacity style={styles.checkbox} onPress={() => toggle(setConsentService, consentService)}>
-        <Text style={styles.checkboxText}>
-          {consentService ? '☑' : '☐'} Service (commande prête, SAV…)
-        </Text>
+        <Text style={styles.checkboxText}>{consentService ? '☑' : '☐'} Service (commande prête, SAV…)</Text>
       </TouchableOpacity>
       <TouchableOpacity style={styles.checkbox} onPress={() => toggle(setConsentMarketing, consentMarketing)}>
-        <Text style={styles.checkboxText}>
-          {consentMarketing ? '☑' : '☐'} Marketing (promos / relances)
-        </Text>
+        <Text style={styles.checkboxText}>{consentMarketing ? '☑' : '☐'} Marketing (promos / relances)</Text>
       </TouchableOpacity>
 
       {/* Produits */}
@@ -590,10 +569,7 @@ export default function AddClientPage() {
                 style={styles.modalButton}
                 onPress={() => {
                   setShowSMSModal(false);
-                  // affiche la progression immédiatement
-                  setSending(true);
-                  setSendStep('prep');
-                  setSendError(null);
+                  setSending(true); setSendStep('prep'); setSendError(null);
                   setTimeout(() => sendTemplate(label), 60);
                 }}
                 activeOpacity={0.7}
@@ -605,11 +581,7 @@ export default function AddClientPage() {
 
             <TouchableOpacity
               style={[styles.modalButton, { marginTop: 8 }]}
-              onPress={() => {
-                setShowSMSModal(false);
-                setCustomText('');
-                setTimeout(() => setShowCustomModal(true), 50);
-              }}
+              onPress={() => { setShowSMSModal(false); setCustomText(''); setTimeout(() => setShowCustomModal(true), 50); }}
             >
               <Text style={styles.modalButtonText}>Personnalisé</Text>
             </TouchableOpacity>
@@ -626,9 +598,7 @@ export default function AddClientPage() {
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Message personnalisé</Text>
-            <Text style={[styles.modalSubtitle, { marginBottom: 6 }]}>
-              Placeholders: {'{prenom}'} et {'{nom}'}.
-            </Text>
+            <Text style={[styles.modalSubtitle, { marginBottom: 6 }]}>Placeholders: {'{prenom}'} et {'{nom}'}.</Text>
             <TextInput
               style={[styles.input, { width: '100%' }]}
               value={customText}
@@ -639,10 +609,7 @@ export default function AddClientPage() {
             />
 
             <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
-              <TouchableOpacity
-                style={[styles.modalActionBtn, { backgroundColor: '#28a745', flex: 1 }]}
-                onPress={sendCustom}
-              >
+              <TouchableOpacity style={[styles.modalActionBtn, { backgroundColor: '#28a745', flex: 1 }]} onPress={sendCustom}>
                 <Text style={styles.modalActionText}>Envoyer</Text>
               </TouchableOpacity>
             </View>
@@ -671,10 +638,6 @@ export default function AddClientPage() {
                     if (pickerOpen === 'month') setBMonth(opt.value);
                     if (pickerOpen === 'year') setBYear(opt.value);
                     setPickerOpen(null);
-                    const d = pickerOpen === 'day' ? opt.value : bDay;
-                    const m = pickerOpen === 'month' ? opt.value : bMonth;
-                    const y = pickerOpen === 'year' ? opt.value : bYear;
-                    if (d && m && y) setDateNaissance(`${d}/${m}/${y}`);
                   }}
                 >
                   <Text style={styles.pickerItemText}>{opt.label}</Text>
@@ -695,9 +658,7 @@ export default function AddClientPage() {
             <Text style={styles.progressTitle}>Envoi du SMS…</Text>
             {sendStep !== 'done' && sendStep !== 'error' && <ActivityIndicator size="large" color="#fff" />}
             <View style={{ marginTop: 12 }}>
-              <Text style={styles.progressLine}>
-                {sendStep === 'prep' ? '• Préparation…' : '✓ Préparation'}
-              </Text>
+              <Text style={styles.progressLine}>{sendStep === 'prep' ? '• Préparation…' : '✓ Préparation'}</Text>
               <Text style={styles.progressLine}>
                 {sendStep === 'send' ? '• Envoi au serveur…' : (sendStep === 'prep' ? '• Envoi au serveur' : '✓ Envoi au serveur')}
               </Text>
@@ -706,7 +667,10 @@ export default function AddClientPage() {
             </View>
 
             {sendStep === 'error' && (
-              <TouchableOpacity style={[styles.modalActionBtn, { backgroundColor: '#ff3b30', marginTop: 12 }]} onPress={() => setSending(false)}>
+              <TouchableOpacity
+                style={[styles.modalActionBtn, { backgroundColor: '#ff3b30', marginTop: 12 }]}
+                onPress={() => setSending(false)}
+              >
                 <Text style={styles.modalActionText}>Fermer</Text>
               </TouchableOpacity>
             )}
@@ -724,59 +688,47 @@ export default function AddClientPage() {
   );
 }
 
+/* =========================
+ * Styles
+ * ========================= */
+
 const styles = StyleSheet.create({
   container: { padding: 20, backgroundColor: '#000', flexGrow: 1 },
   label: { fontWeight: 'bold', marginTop: 16, color: '#fff' },
   subLabel: { marginTop: 12, fontWeight: '600', color: '#ccc' },
   input: {
-    borderWidth: 1,
-    borderColor: '#555',
-    borderRadius: 6,
-    padding: 10,
-    marginTop: 4,
-    color: '#fff',
-    backgroundColor: '#111',
+    borderWidth: 1, borderColor: '#555', borderRadius: 6,
+    padding: 10, marginTop: 4, color: '#fff', backgroundColor: '#111',
   },
   // Date of birth selects
   dobRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6 },
   dobSelect: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#555',
-    borderRadius: 6,
-    paddingVertical: 10,
-    alignItems: 'center',
-    backgroundColor: '#111',
+    flex: 1, borderWidth: 1, borderColor: '#555', borderRadius: 6,
+    paddingVertical: 10, alignItems: 'center', backgroundColor: '#111',
   },
   dobSelectText: { color: '#fff', fontWeight: '600' },
 
   checkbox: { marginTop: 10 },
   checkboxText: { color: '#fff', fontSize: 16 },
-  button: {
-    marginTop: 24,
-    backgroundColor: '#007AFF',
-    padding: 14,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  smsButton: {
-    marginTop: 12,
-    backgroundColor: '#28a745',
-    padding: 14,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  buttonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
-  homeButton: {
-    marginTop: 30,
-    backgroundColor: '#1a1a1a',
-    padding: 14,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  homeButtonText: { color: '#00BFFF', fontWeight: '600', fontSize: 16 },
+
   row: { flexDirection: 'row', alignItems: 'center', gap: 16, marginTop: 10 },
   checkboxInline: { paddingVertical: 6 },
+
+  button: {
+    marginTop: 24, backgroundColor: '#007AFF', padding: 14,
+    borderRadius: 10, alignItems: 'center',
+  },
+  smsButton: {
+    marginTop: 12, backgroundColor: '#28a745', padding: 14,
+    borderRadius: 10, alignItems: 'center',
+  },
+  buttonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
+
+  homeButton: {
+    marginTop: 30, backgroundColor: '#1a1a1a', padding: 14,
+    borderRadius: 10, alignItems: 'center',
+  },
+  homeButtonText: { color: '#00BFFF', fontWeight: '600', fontSize: 16 },
 
   // Modals (génériques)
   modalOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)' },
@@ -804,17 +756,9 @@ const styles = StyleSheet.create({
 
   // Toast
   toast: {
-    position: 'absolute',
-    left: 20,
-    right: 20,
-    bottom: 30,
-    backgroundColor: '#1f2937',
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#374151',
-    alignItems: 'center',
+    position: 'absolute', left: 20, right: 20, bottom: 30,
+    backgroundColor: '#1f2937', paddingVertical: 10, paddingHorizontal: 14,
+    borderRadius: 10, borderWidth: 1, borderColor: '#374151', alignItems: 'center',
   },
   toastText: { color: '#fff', fontWeight: '600' },
 });
