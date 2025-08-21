@@ -1,12 +1,4 @@
 // SettingsPage.tsx — sync serveur : alias expéditeur, signature, prefs & TEMPLATES (partagés)
-// Endpoints utilisés :
-//  - GET  /api/licence?cle=...&id=...     (retourne { licence })
-//  - POST /licence/expediteur             { licenceId, libelleExpediteur }
-//  - POST /licence/signature              { licenceId, signature }
-//  - GET  /api/licence/prefs?licenceId=... (automatisations)
-//  - POST /api/licence/prefs              { licenceId, ... }
-//  - GET  /api/templates?licenceId=...    -> { items: Template[] }
-//  - POST /api/templates/save             { licenceId, items: Template[] }
 
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import {
@@ -25,34 +17,30 @@ const PRIVACY_URL  = `${SERVER_BASE}/legal/privacy.md`;
 const CGV_LATEST_URL = `${SERVER_BASE}/legal/cgv-2025-08-14.md`;
 
 // --- API builders ---
-
 const LICENCE_GET = (cle?: string, id?: string, bust?: number) => {
   const sp = new URLSearchParams();
   if (cle) sp.set('cle', cle);
   if (id)  sp.set('id', id);
-  if (bust) sp.set('_', String(bust)); // <- anti-cache
+  if (bust) sp.set('_', String(bust));
   return `${SERVER_BASE}/api/licence?${sp.toString()}`;
 };
-
 
 const CGV_STATUS = (cle?: string, id?: string) => {
   const sp = new URLSearchParams();
   if (cle) sp.set('cle', cle);
-  if (id)  sp.set('licenceId', id);          // cet endpoint lit "licenceId"
+  if (id)  sp.set('licenceId', id);
   return `${SERVER_BASE}/licence/cgv-status?${sp.toString()}`;
 };
 
-const LICENCE_PREFS_GET = (licenceId: string) =>
-  `${SERVER_BASE}/api/licence/prefs?licenceId=${encodeURIComponent(licenceId)}`;
+const LICENCE_PREFS_GET  = (licenceId: string) => `${SERVER_BASE}/api/licence/prefs?licenceId=${encodeURIComponent(licenceId)}`;
 const LICENCE_PREFS_POST = `${SERVER_BASE}/api/licence/prefs`;
 
-const TEMPLATES_GET = (licenceId: string) =>
-  `${SERVER_BASE}/api/templates?licenceId=${encodeURIComponent(licenceId)}`;
+const TEMPLATES_GET  = (licenceId: string) => `${SERVER_BASE}/api/templates?licenceId=${encodeURIComponent(licenceId)}`;
 const TEMPLATES_SAVE = `${SERVER_BASE}/api/templates/save`;
 
 // --- Types ---
 type CustomMessage = { title: string; content: string };
-type TemplateItem = { id: string; label: string; text: string };
+type TemplateItem  = { id: string; label: string; text: string };
 
 const safeParseJSON = <T = any,>(raw: string | null): T | null => {
   if (!raw) return null;
@@ -84,12 +72,12 @@ async function getJSON(url: string) {
 }
 
 export default function SettingsPage() {
+  const navigation = useNavigation();
+
   const [licence, setLicence] = useState<any>(null); // contient la clé sous licence.licence
   const [expediteurRaw, setExpediteurRaw] = useState('');
   const [signature, setSignature] = useState('');
-  // messages stockés par ID (clé = id template)
   const [messages, setMessages] = useState<Record<string, CustomMessage>>({});
-  const navigation = useNavigation();
   const [showLogoutModal, setShowLogoutModal] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -108,7 +96,8 @@ export default function SettingsPage() {
 
   // IDs (réévalués)
   const cleLicence = String(licence?.licence || '').trim();
-  const licenceId = String(licence?.id || '').trim();
+  const licenceId  = String(licence?.id || '').trim();
+  const opticienId = String(licence?.opticien?.id || '').trim() || undefined;
 
   // ------ Chargement initial (local) puis sync serveur ------
   useEffect(() => {
@@ -207,9 +196,7 @@ export default function SettingsPage() {
 
       // 1) Licence: alias + signature
       try {
-      
         const licResp = await getJSON(LICENCE_GET(cleLicence, licenceId, Date.now()));
-
         const newLicence = licResp?.licence ?? licResp;
         if (newLicence) {
           setLicence(newLicence);
@@ -276,150 +263,152 @@ export default function SettingsPage() {
     }
   }, [cleLicence, licenceId, messages]);
 
-  // ------ Save expéditeur / signature (POST vers /licence/*) ------
-  // helper: fallback to resolve licenceId from key when needed
-// 1) helper: resolve id depuis la clé si besoin
-async function resolveLicenceIdFromCle(cle?: string): Promise<string | null> {
-  if (!cle) return null;
-  try {
-    const r = await fetch(`${SERVER_BASE}/api/licence?cle=${encodeURIComponent(cle)}&_=${Date.now()}`, {
-      headers: { Accept: 'application/json' },
+  // ------ Helpers ID ------
+  async function resolveLicenceIdFromCle(cle?: string): Promise<string | null> {
+    if (!cle) return null;
+    try {
+      const r = await fetch(`${SERVER_BASE}/api/licence?cle=${encodeURIComponent(cle)}&_=${Date.now()}`, {
+        headers: { Accept: 'application/json' },
+      });
+      const j = await r.json().catch(() => ({}));
+      const lic = j?.licence ?? j;
+      return lic?.id ? String(lic.id) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ------ POST JSON strict ------
+  const postJson = async (url: string, body: any) => {
+    const r = await fetch(url, {
+      method: 'POST', // ✅ serveur attend POST
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
-    const j = await r.json().catch(() => ({}));
-    const lic = j?.licence ?? j;
-    return lic?.id ? String(lic.id) : null;
-  } catch {
-    return null;
-  }
-}
-
-// 2) petit POST JSON strict (remonte les vrais messages d’erreur)
-const postJson = async (url: string, body: any) => {
-  const r = await fetch(url, {
-    method: 'POST',                      // <-- POST (pas PUT)
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const j = await r.json().catch(() => ({} as any));
-  if (!r.ok || j?.ok === false) throw new Error(j?.error || `HTTP ${r.status}`);
-  return j;
-};
-
-const saveSenderRemote = useCallback(async (normalized: string) => {
-  if (!licenceId) return false;
-  const payload = { licenceId, libelleExpediteur: normalized };
-
-  try {
-    // 1) route principale
-    const j = await postJson(`${SERVER_BASE}/licence/expediteur`, payload);
-    if (j?.licence) {
-      setLicence(j.licence);
-      await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+    const j = await r.json().catch(() => ({} as any));
+    if (!r.ok || j?.ok === false || j?.success === false) {
+      throw new Error(j?.error || `HTTP ${r.status}`);
     }
-    return true;
-  } catch (e1) {
-    // 2) fallback éventuel
+    return j;
+  };
+
+  // ------ Save expéditeur / signature (routes: /licence/* avec fallback /api/licence/*) ------
+  const saveSenderRemote = useCallback(async (normalized: string) => {
+    // récup ID fiable (id > cle)
+    let id = licenceId?.trim();
+    if (!id) id = await resolveLicenceIdFromCle(cleLicence);
+    if (!id) return false;
+
+    const payload = { licenceId: id, opticienId, libelleExpediteur: normalized };
+
     try {
-      const j = await postJson(`${SERVER_BASE}/api/licence/expediteur`, payload);
+      const j = await postJson(`${SERVER_BASE}/licence/expediteur`, payload);
       if (j?.licence) {
         setLicence(j.licence);
         await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
       }
       return true;
-    } catch (e2) {
-      console.warn('saveSenderRemote error:', e2);
-      return false;
-    }
-  }
-}, [licenceId]);
-
-const saveSignatureRemote = useCallback(async (sig: string) => {
-  if (!licenceId) return false;
-  const payload = { licenceId, signature: sig };
-
-  try {
-    const j = await postJson(`${SERVER_BASE}/licence/signature`, payload);
-    if (j?.licence) {
-      setLicence(j.licence);
-      await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
-    }
-    return true;
-  } catch (e1) {
-    try {
-      const j = await postJson(`${SERVER_BASE}/api/licence/signature`, payload);
-      if (j?.licence) {
-        setLicence(j.licence);
-        await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
-      }
-      return true;
-    } catch (e2) {
-      console.warn('saveSignatureRemote error:', e2);
-      return false;
-    }
-  }
-}, [licenceId]);
-
-
-// 5) handleSaveBasics — met à jour local, push serveur, puis REFETCH avec cache-buster
-const handleSaveBasics = async () => {
-  try {
-    const normalized = normalizeSender(expediteurRaw);
-    if (normalized.length < 3) {
-      Alert.alert('Expéditeur', 'Doit contenir 3 à 11 caractères alphanumériques.');
-      return;
-    }
-
-    // MAJ locale immédiate
-    await AsyncStorage.setItem('signature', signature);
-    if (licence) {
-      const updated = { ...licence, libelleExpediteur: normalized, signature };
-      setLicence(updated);
-      await AsyncStorage.setItem('licence', JSON.stringify(updated));
-    }
-    setExpediteurRaw(normalized);
-
-    // push serveur en parallèle
-    const [okSender, okSig] = await Promise.all([
-      saveSenderRemote(normalized),
-      saveSignatureRemote(signature),
-    ]);
-
-    // refetch FRAIS si au moins un a réussi
-    if (okSender || okSig) {
+    } catch (e1) {
       try {
-        let id = licenceId?.trim();
-        if (!id) id = await resolveLicenceIdFromCle(cleLicence);
-        if (id) {
-          const ref = await fetch(`${SERVER_BASE}/api/licence?id=${encodeURIComponent(id)}&_=${Date.now()}`, {
-            headers: { Accept: 'application/json' },
-          });
-          const txt = await ref.text();
-          if (ref.ok && txt) {
-            const data = JSON.parse(txt);
-            const fresh = data?.licence ?? data;
-            if (fresh) {
-              setLicence(fresh);
-              await AsyncStorage.setItem('licence', JSON.stringify(fresh));
-              setExpediteurRaw(String(fresh.libelleExpediteur || fresh.opticien?.enseigne || 'OptiCOM'));
-              if (typeof fresh.signature === 'string') {
-                setSignature(fresh.signature);
-                await AsyncStorage.setItem('signature', fresh.signature);
+        const j = await postJson(`${SERVER_BASE}/api/licence/expediteur`, payload);
+        if (j?.licence) {
+          setLicence(j.licence);
+          await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+        }
+        return true;
+      } catch (e2) {
+        console.warn('saveSenderRemote error:', e2);
+        return false;
+      }
+    }
+  }, [licenceId, cleLicence, opticienId]);
+
+  const saveSignatureRemote = useCallback(async (sig: string) => {
+    let id = licenceId?.trim();
+    if (!id) id = await resolveLicenceIdFromCle(cleLicence);
+    if (!id) return false;
+
+    const payload = { licenceId: id, opticienId, signature: String(sig ?? '').trim().slice(0, 200) };
+
+    try {
+      const j = await postJson(`${SERVER_BASE}/licence/signature`, payload);
+      if (j?.licence) {
+        setLicence(j.licence);
+        await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+      }
+      return true;
+    } catch (e1) {
+      try {
+        const j = await postJson(`${SERVER_BASE}/api/licence/signature`, payload);
+        if (j?.licence) {
+          setLicence(j.licence);
+          await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+        }
+        return true;
+      } catch (e2) {
+        console.warn('saveSignatureRemote error:', e2);
+        return false;
+      }
+    }
+  }, [licenceId, cleLicence, opticienId]);
+
+  // ------ Enregistrement de base (expéditeur + signature) ------
+  const handleSaveBasics = async () => {
+    try {
+      const normalized = normalizeSender(expediteurRaw);
+      if (normalized.length < 3) {
+        Alert.alert('Expéditeur', 'Doit contenir 3 à 11 caractères alphanumériques.');
+        return;
+      }
+
+      // MAJ locale immédiate
+      await AsyncStorage.setItem('signature', signature);
+      if (licence) {
+        const updated = { ...licence, libelleExpediteur: normalized, signature };
+        setLicence(updated);
+        await AsyncStorage.setItem('licence', JSON.stringify(updated));
+      }
+      setExpediteurRaw(normalized);
+
+      // push serveur en parallèle
+      const [okSender, okSig] = await Promise.all([
+        saveSenderRemote(normalized),
+        saveSignatureRemote(signature),
+      ]);
+
+      // Refetch FRAIS si au moins un a réussi
+      if (okSender || okSig) {
+        try {
+          let id = licenceId?.trim();
+          if (!id) id = await resolveLicenceIdFromCle(cleLicence);
+          if (id) {
+            const ref = await fetch(`${SERVER_BASE}/api/licence?id=${encodeURIComponent(id)}&_=${Date.now()}`, {
+              headers: { Accept: 'application/json' },
+            });
+            const txt = await ref.text();
+            if (ref.ok && txt) {
+              const data = JSON.parse(txt);
+              const fresh = data?.licence ?? data;
+              if (fresh) {
+                setLicence(fresh);
+                await AsyncStorage.setItem('licence', JSON.stringify(fresh));
+                setExpediteurRaw(String(fresh.libelleExpediteur || fresh.opticien?.enseigne || 'OptiCOM'));
+                if (typeof fresh.signature === 'string') {
+                  setSignature(fresh.signature);
+                  await AsyncStorage.setItem('signature', fresh.signature);
+                }
               }
             }
           }
-        }
-      } catch {
-        /* si le refetch rate, on garde l’état local */
+        } catch {/* noop */}
+        Alert.alert('Paramètres', 'Enregistrés avec succès.');
+      } else {
+        Alert.alert('Paramètres', 'Enregistré localement. (Serveur indisponible)');
       }
-      Alert.alert('Paramètres', 'Enregistrés avec succès.');
-    } else {
-      Alert.alert('Paramètres', 'Enregistré localement. (Serveur indisponible)');
+    } catch {
+      Alert.alert('Erreur', 'Impossible de sauvegarder les paramètres.');
     }
-  } catch (e) {
-    Alert.alert('Erreur', 'Impossible de sauvegarder les paramètres.');
-  }
-};
-
+  };
 
   // ------ Automatisations ------
   const handleSaveAutomations = async () => {
@@ -782,6 +771,9 @@ const handleSaveBasics = async () => {
   );
 }
 
+/* =========================
+ * Styles
+ * ========================= */
 const styles = StyleSheet.create({
   container: { padding: 30, paddingBottom: 50 },
   title: { fontSize: 24, fontWeight: 'bold', color: '#fff', marginBottom: 20, textAlign: 'center' },
