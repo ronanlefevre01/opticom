@@ -6,7 +6,7 @@ import {
   TouchableOpacity, Alert, ScrollView, Linking, Switch,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, CommonActions } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 
 const SERVER_BASE = 'https://opticom-sms-server.onrender.com';
@@ -21,7 +21,7 @@ const LICENCE_GET = (cle?: string, id?: string, bust?: number) => {
   const sp = new URLSearchParams();
   if (cle) sp.set('cle', cle);
   if (id)  sp.set('id', id);
-  if (bust) sp.set('_', String(bust));
+  if (bust) sp.set('_', String(bust)); // anti-cache
   return `${SERVER_BASE}/api/licence?${sp.toString()}`;
 };
 const CGV_STATUS = (cle?: string, id?: string) => {
@@ -39,7 +39,7 @@ const TEMPLATES_SAVE = `${SERVER_BASE}/api/templates/save`;
 type CustomMessage = { title: string; content: string };
 type TemplateItem  = { id: string; label: string; text: string };
 
-// ✅ CORRECTION TSX : fonction générique en déclaration (pas d’arrow générique en tête)
+// ✅ parse JSON sûr
 function safeParseJSON<T = any>(raw: string | null): T | null {
   if (!raw) return null;
   try { return JSON.parse(raw) as T; } catch { return null; }
@@ -90,33 +90,29 @@ export default function SettingsPage() {
 
   const expediteurNormalized = useMemo(() => normalizeSender(expediteurRaw), [expediteurRaw]);
 
-  // IDs
+  // IDs dérivés (peuvent être vides si non connectés)
   const cleLicence = String(licence?.licence || '').trim();
   const licenceId  = String(licence?.id || '').trim();
   const opticienId = String(licence?.opticien?.id || '').trim() || undefined;
 
   // -------- helpers ID & POST strict --------
   const ensureLicenceId = useCallback(async (): Promise<string> => {
-    if (licenceId) return licenceId;
+    if (licence?.id) return String(licence.id);
+
     const local = safeParseJSON<any>(await AsyncStorage.getItem('licence'));
-    const idFromLocal = String(local?.id || '').trim();
-    if (idFromLocal) return idFromLocal;
+    if (local?.id) return String(local.id);
 
     const key = String(local?.licence || licence?.licence || '').trim();
     if (!key) throw new Error('NO_LICENCE_KEY');
 
-    const r = await fetch(`${SERVER_BASE}/api/licence?cle=${encodeURIComponent(key)}&_=${Date.now()}`, {
-      headers: { Accept: 'application/json' },
-    });
+    const r = await fetch(`${SERVER_BASE}/api/licence?cle=${encodeURIComponent(key)}&_=${Date.now()}`);
     const j = await r.json().catch(() => ({}));
-    const lic = j?.licence ?? j;
-    const id = String(lic?.id || '').trim();
+    const id = String((j?.licence ?? j)?.id || '').trim();
     if (!id) throw new Error('LICENCE_NOT_FOUND');
     return id;
-  }, [licence, licenceId]);
+  }, [licence]);
 
   const postJson = async (url: string, body: any) => {
-    console.debug('[POST]', url, body);
     const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -189,7 +185,7 @@ export default function SettingsPage() {
 
       await syncFromServer(true);
     })();
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // --- CGV depuis le serveur ---
   useEffect(() => {
@@ -210,7 +206,7 @@ export default function SettingsPage() {
     })();
   }, [cleLicence, licenceId]);
 
-  // --- Sync licence + prefs + templates ---
+  // --- Templates : save helper (utilisé aussi par sync) ---
   const saveTemplatesToServer = useCallback(async (licId: string, map: Record<string, CustomMessage>) => {
     const items: TemplateItem[] = Object.entries(map).map(([id, v]) => ({ id, label: v.title ?? id, text: v.content ?? '' }));
     const r = await fetch(TEMPLATES_SAVE, {
@@ -223,6 +219,7 @@ export default function SettingsPage() {
     return j;
   }, []);
 
+  // --- Sync licence + prefs + templates ---
   const syncFromServer = useCallback(async (initial = false) => {
     if (!cleLicence && !licenceId) return;
     try {
@@ -294,7 +291,10 @@ export default function SettingsPage() {
         await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
       }
       return true;
-    } catch (e) { console.warn('saveSenderRemote error:', e); return false; }
+    } catch (e) {
+      console.warn('saveSenderRemote error:', e);
+      return false;
+    }
   }, [ensureLicenceId, opticienId]);
 
   const saveSignatureRemote = useCallback(async (sig: string) => {
@@ -307,7 +307,10 @@ export default function SettingsPage() {
         await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
       }
       return true;
-    } catch (e) { console.warn('saveSignatureRemote error:', e); return false; }
+    } catch (e) {
+      console.warn('saveSignatureRemote error:', e);
+      return false;
+    }
   }, [ensureLicenceId, opticienId]);
 
   const handleSaveBasics = async () => {
@@ -409,15 +412,40 @@ export default function SettingsPage() {
     }
   };
 
+  // --- Navigation helpers ---
   const handleReturnHome = () => { navigation.navigate('Home' as never); };
-  const handleGoToLicence = () => { navigation.reset({ index: 0, routes: [{ name: 'LicenceCheckPage' as never }] } as any); };
+
+  const handleGoToLicence = () => {
+    navigation.dispatch(
+      CommonActions.reset({ index: 0, routes: [{ name: 'licencechackpage' }] })
+    );
+  };
+
   const handleLogout = async () => {
     try {
-      await AsyncStorage.removeItem('licence');
-      await AsyncStorage.removeItem('licence.key');
-      await AsyncStorage.removeItem('signature');
-      navigation.reset({ index: 0, routes: [{ name: 'LicenceCheckPage' as never }] } as any);
-    } catch { Alert.alert('Erreur', 'Impossible de se déconnecter.'); }
+      await AsyncStorage.multiRemove([
+        'licence',
+        'licence.key',
+        'signature',
+        'messages',
+        'autoBirthdayEnabled',
+        'autoLensRenewalEnabled',
+        'autoBirthdayMessage',
+        'autoLensMessage',
+        'lensAdvanceDays',
+      ]);
+      // vider l'état local
+      setLicence(null);
+      setExpediteurRaw('');
+      setSignature('');
+      setMessages({});
+
+      navigation.dispatch(
+        CommonActions.reset({ index: 0, routes: [{ name: 'licencechackpage' }] })
+      );
+    } catch {
+      Alert.alert('Erreur', 'Impossible de se déconnecter.');
+    }
   };
 
   if (isLoading) {
@@ -564,7 +592,7 @@ export default function SettingsPage() {
         <TouchableOpacity style={styles.linkRow} onPress={() => openURLSafe(CGV_LATEST_URL)}><Text style={styles.linkText}>📄 Conditions Générales de Vente (CGV)</Text></TouchableOpacity>
       </View>
 
-      <TouchableOpacity style={styles.secondaryButton} onPress={() => navigation.navigate('Home' as never)}>
+      <TouchableOpacity style={styles.secondaryButton} onPress={handleReturnHome}>
         <Text style={styles.secondaryButtonText}>🏠 Retour à l’accueil</Text>
       </TouchableOpacity>
 
