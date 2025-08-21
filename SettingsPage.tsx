@@ -38,6 +38,10 @@ const LICENCE_PREFS_POST = `${SERVER_BASE}/api/licence/prefs`;
 const TEMPLATES_GET  = (licenceId: string) => `${SERVER_BASE}/api/templates?licenceId=${encodeURIComponent(licenceId)}`;
 const TEMPLATES_SAVE = `${SERVER_BASE}/api/templates/save`;
 
+const LICENCE_SET_SENDER    = `${SERVER_BASE}/licence/expediteur`; // sans /api
+const LICENCE_SET_SIGNATURE = `${SERVER_BASE}/licence/signature`;  // sans /api
+
+
 // --- Types ---
 type CustomMessage = { title: string; content: string };
 type TemplateItem  = { id: string; label: string; text: string };
@@ -327,36 +331,37 @@ export default function SettingsPage() {
 
   // --- SAVE expéditeur/signature (POST, endpoints sans /api) ---
   const saveSenderRemote = useCallback(async (normalized: string) => {
-    const id = await ensureLicenceId();
-    const payload = { licenceId: id, opticienId, libelleExpediteur: normalized };
-    try {
-      const j = await postJson(`${SERVER_BASE}/licence/expediteur`, payload);
-      if (j?.licence && !logoutRef.current) {
-        setLicence(j.licence);
-        await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
-      }
-      return true;
-    } catch (e) {
-      if (!logoutRef.current) console.warn('saveSenderRemote error:', e);
-      return false;
-    }
-  }, [ensureLicenceId, opticienId]);
+  const id = licenceId || await ensureLicenceId();
+  const payload = { licenceId: id, opticienId, libelleExpediteur: normalized };
+  const r = await fetch(LICENCE_SET_SENDER, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (j?.licence) {
+    setLicence(j.licence);
+    await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+  }
+  return r.ok && j?.licence;
+}, [licenceId, ensureLicenceId, opticienId]);
 
-  const saveSignatureRemote = useCallback(async (sig: string) => {
-    const id = await ensureLicenceId();
-    const payload = { licenceId: id, opticienId, signature: String(sig ?? '').trim().slice(0, 200) };
-    try {
-      const j = await postJson(`${SERVER_BASE}/licence/signature`, payload);
-      if (j?.licence && !logoutRef.current) {
-        setLicence(j.licence);
-        await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
-      }
-      return true;
-    } catch (e) {
-      if (!logoutRef.current) console.warn('saveSignatureRemote error:', e);
-      return false;
-    }
-  }, [ensureLicenceId, opticienId]);
+const saveSignatureRemote = useCallback(async (sig: string) => {
+  const id = licenceId || await ensureLicenceId();
+  const payload = { licenceId: id, opticienId, signature: String(sig ?? '').trim().slice(0, 200) };
+  const r = await fetch(LICENCE_SET_SIGNATURE, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (j?.licence) {
+    setLicence(j.licence);
+    await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+  }
+  return r.ok && j?.licence;
+}, [licenceId, ensureLicenceId, opticienId]);
+
 
   const handleSaveBasics = async () => {
     try {
