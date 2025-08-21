@@ -1,6 +1,6 @@
 // SettingsPage.tsx — alias expéditeur, signature, prefs & templates (synchro serveur)
 
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import {
   View, Modal, Pressable, Text, TextInput, StyleSheet,
   TouchableOpacity, Alert, ScrollView, Linking, Switch,
@@ -73,6 +73,9 @@ async function getJSON(url: string) {
 export default function SettingsPage() {
   const navigation = useNavigation<any>();
 
+  // --- Flag pour stopper toute sync après logout (évite une reco auto) ---
+  const logoutRef = useRef(false);
+
   // --- Helper pour RESET au niveau du NAVIGATEUR RACINE ---
   const resetToLicenceCheck = useCallback(() => {
     let nav: any = navigation;
@@ -116,6 +119,7 @@ export default function SettingsPage() {
 
   // -------- helpers ID & POST strict --------
   const ensureLicenceId = useCallback(async (): Promise<string> => {
+    if (logoutRef.current) throw new Error('LOGGED_OUT');
     if (licence?.id) return String(licence.id);
 
     const local = safeParseJSON<any>(await AsyncStorage.getItem('licence'));
@@ -132,6 +136,7 @@ export default function SettingsPage() {
   }, [licence]);
 
   const postJson = async (url: string, body: any) => {
+    if (logoutRef.current) throw new Error('LOGGED_OUT');
     const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -225,7 +230,9 @@ export default function SettingsPage() {
     if (!cleLicence && !licenceId) { setCgvInfo(null); return; }
     (async () => {
       try {
+        if (logoutRef.current) return;
         const r = await fetch(CGV_STATUS(cleLicence, licenceId));
+        if (logoutRef.current) return;
         const j = await r.json();
         if (r.ok) {
           setCgvInfo({
@@ -241,6 +248,7 @@ export default function SettingsPage() {
 
   // --- Templates : save helper (utilisé aussi par sync) ---
   const saveTemplatesToServer = useCallback(async (licId: string, map: Record<string, CustomMessage>) => {
+    if (logoutRef.current) return;
     const items: TemplateItem[] = Object.entries(map).map(([id, v]) => ({ id, label: v.title ?? id, text: v.content ?? '' }));
     const r = await fetch(TEMPLATES_SAVE, {
       method: 'POST',
@@ -254,6 +262,7 @@ export default function SettingsPage() {
 
   // --- Sync licence + prefs + templates ---
   const syncFromServer = useCallback(async (initial = false) => {
+    if (logoutRef.current) return;
     if (!cleLicence && !licenceId) return;
     try {
       setSyncing(true); setSyncError(null);
@@ -261,6 +270,7 @@ export default function SettingsPage() {
       // 1) licence
       try {
         const licResp = await getJSON(LICENCE_GET(cleLicence, licenceId, Date.now()));
+        if (logoutRef.current) return;
         const newLicence = licResp?.licence ?? licResp;
         if (newLicence) {
           setLicence(newLicence);
@@ -275,9 +285,10 @@ export default function SettingsPage() {
       } catch (e) { if (!initial) console.warn('Licence GET failed:', (e as Error).message); }
 
       // 2) prefs
-      if (licenceId) {
+      if (!logoutRef.current && licenceId) {
         try {
           const prefs = await getJSON(LICENCE_PREFS_GET(licenceId));
+          if (logoutRef.current) return;
           setAutoBirthday(!!prefs.autoBirthdayEnabled);
           setAutoLensRenewal(!!prefs.autoLensRenewalEnabled);
           setAutoBirthdayMessage(String(prefs.messageBirthday || 'Joyeux anniversaire {prenom} !'));
@@ -295,9 +306,10 @@ export default function SettingsPage() {
       }
 
       // 3) templates
-      if (licenceId) {
+      if (!logoutRef.current && licenceId) {
         try {
           const t = await getJSON(TEMPLATES_GET(licenceId));
+          if (logoutRef.current) return;
           const items: TemplateItem[] = Array.isArray(t?.items) ? t.items : [];
           if (items.length) {
             const next: Record<string, CustomMessage> = {};
@@ -309,8 +321,8 @@ export default function SettingsPage() {
           }
         } catch (e) { if (!initial) console.warn('Templates GET failed:', (e as Error).message); }
       }
-    } catch (e: any) { setSyncError(e?.message || 'Erreur inconnue'); }
-    finally { setSyncing(false); }
+    } catch (e: any) { if (!logoutRef.current) setSyncError(e?.message || 'Erreur inconnue'); }
+    finally { if (!logoutRef.current) setSyncing(false); }
   }, [cleLicence, licenceId, messages, saveTemplatesToServer]);
 
   // --- SAVE expéditeur/signature (POST, endpoints sans /api) ---
@@ -319,13 +331,13 @@ export default function SettingsPage() {
     const payload = { licenceId: id, opticienId, libelleExpediteur: normalized };
     try {
       const j = await postJson(`${SERVER_BASE}/licence/expediteur`, payload);
-      if (j?.licence) {
+      if (j?.licence && !logoutRef.current) {
         setLicence(j.licence);
         await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
       }
       return true;
     } catch (e) {
-      console.warn('saveSenderRemote error:', e);
+      if (!logoutRef.current) console.warn('saveSenderRemote error:', e);
       return false;
     }
   }, [ensureLicenceId, opticienId]);
@@ -335,13 +347,13 @@ export default function SettingsPage() {
     const payload = { licenceId: id, opticienId, signature: String(sig ?? '').trim().slice(0, 200) };
     try {
       const j = await postJson(`${SERVER_BASE}/licence/signature`, payload);
-      if (j?.licence) {
+      if (j?.licence && !logoutRef.current) {
         setLicence(j.licence);
         await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
       }
       return true;
     } catch (e) {
-      console.warn('saveSignatureRemote error:', e);
+      if (!logoutRef.current) console.warn('saveSignatureRemote error:', e);
       return false;
     }
   }, [ensureLicenceId, opticienId]);
@@ -454,26 +466,23 @@ export default function SettingsPage() {
 
   const handleLogout = async () => {
     try {
-      await AsyncStorage.multiRemove([
-        'licence',
-        'licence.key',
-        'signature',
-        'messages',
-        'autoBirthdayEnabled',
-        'autoLensRenewalEnabled',
-        'autoBirthdayMessage',
-        'autoLensMessage',
-        'lensAdvanceDays',
-      ]);
+      logoutRef.current = true; // bloque toute sync/POST qui traîne
 
+      // Nettoyage *total* du stockage de l’app (évite clés oubliées)
+      const keys = await AsyncStorage.getAllKeys();
+      if (keys && keys.length) await AsyncStorage.multiRemove(keys);
+
+      // Purge état local + fermer la modale
       setShowLogoutModal(false);
       setLicence(null);
       setExpediteurRaw('');
       setSignature('');
       setMessages({});
 
+      // attendre un tick pour laisser React appliquer l’état
       await new Promise(r => setTimeout(r, 0));
 
+      // Reset global vers l’écran de licence
       resetToLicenceCheck();
     } catch {
       Alert.alert('Erreur', 'Impossible de se déconnecter.');
