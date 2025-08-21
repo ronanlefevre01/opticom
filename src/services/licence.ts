@@ -1,6 +1,7 @@
 // src/services/licence.ts
 import API_BASE from "@/config/api";
 
+/* --- helpers HTTP --- */
 async function getJSON(url: string) {
   const r = await fetch(url);
   const t = await r.text();
@@ -19,33 +20,54 @@ async function postJSON(path: string, body: any) {
   return t ? JSON.parse(t) : {};
 }
 
-/** Lecture licence — ATTENTION: le serveur attend ?cle= ou ?id= */
+/* --- API licence (lecture) ---
+   Le serveur supporte /api/licence?cle=... ou ?id=... */
 export function fetchLicenceFromServer(cle: string) {
   if (!cle) throw new Error("Aucune clé licence trouvée");
   return getJSON(`${API_BASE}/api/licence?cle=${encodeURIComponent(cle)}`);
 }
 
-/** MAJ expéditeur
- *  Serveur: POST /licence/expediteur
- *  Payload accepté: { cle?: string, licenceId?: string, libelleExpediteur: string, opticienId?: string }
- *  On conserve la compat v1 en envoyant la clé + libelleExpediteur.
- */
-export function updateExpediteur(cle: string, expediteur: string) {
-  if (!cle) throw new Error("Aucune clé licence");
-  return postJSON("/licence/expediteur", {
-    cle,
-    libelleExpediteur: expediteur,
-  });
+/* Résout l'ID interne à partir d'une clé, si besoin */
+async function ensureLicenceId(opts: { licenceId?: string; cle?: string }) {
+  if (opts.licenceId) return opts.licenceId;
+  if (!opts.cle) throw new Error("Aucune clé licence");
+  const j = await getJSON(`${API_BASE}/api/licence?cle=${encodeURIComponent(opts.cle)}`);
+  const id = String((j?.licence ?? j)?.id || "");
+  if (!id) throw new Error("LICENCE_NOT_FOUND");
+  return id;
 }
 
-/** MAJ signature
- *  Serveur: POST /licence/signature
- *  Payload accepté: { cle?: string, licenceId?: string, signature: string, opticienId?: string }
- */
-export function updateSignature(cle: string, signature: string) {
-  if (!cle) throw new Error("Aucune clé licence");
-  return postJSON("/licence/signature", {
-    cle,
-    signature,
-  });
+/* --- MAJ expéditeur ---
+   Serveur: POST /licence/expediteur
+   Payload: { licenceId, libelleExpediteur, opticienId? }
+*/
+export async function updateExpediteur(
+  cleOrOpts: string | { licenceId?: string; cle?: string; opticienId?: string },
+  expediteur: string
+) {
+  const opts =
+    typeof cleOrOpts === "string" ? { cle: cleOrOpts } : cleOrOpts || {};
+  const licenceId = await ensureLicenceId(opts);
+  const body: any = {
+    licenceId,
+    libelleExpediteur: expediteur,
+  };
+  if (opts.opticienId) body.opticienId = opts.opticienId;
+  return postJSON("/licence/expediteur", body);
+}
+
+/* --- MAJ signature ---
+   Serveur: POST /licence/signature
+   Payload: { licenceId, signature, opticienId? }
+*/
+export async function updateSignature(
+  cleOrOpts: string | { licenceId?: string; cle?: string; opticienId?: string },
+  signature: string
+) {
+  const opts =
+    typeof cleOrOpts === "string" ? { cle: cleOrOpts } : cleOrOpts || {};
+  const licenceId = await ensureLicenceId(opts);
+  const body: any = { licenceId, signature };
+  if (opts.opticienId) body.opticienId = opts.opticienId;
+  return postJSON("/licence/signature", body);
 }
