@@ -7,9 +7,10 @@ async function getJSON(url: string) {
   if (!r.ok) throw new Error(`HTTP ${r.status}: ${t}`);
   return t ? JSON.parse(t) : {};
 }
-async function putJSON(path: string, body: any) {
+
+async function postJSON(path: string, body: any) {
   const r = await fetch(`${API_BASE}${path}`, {
-    method: "PUT",
+    method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -24,14 +25,27 @@ export function fetchLicenceFromServer(cle: string) {
   return getJSON(`${API_BASE}/api/licence?cle=${encodeURIComponent(cle)}`);
 }
 
-/** MAJ expéditeur: body = { cle, expediteur } */
+/** MAJ expéditeur
+ *  Serveur: POST /licence/expediteur
+ *  Payload accepté: { cle?: string, licenceId?: string, libelleExpediteur: string, opticienId?: string }
+ *  On conserve la compat v1 en envoyant la clé + libelleExpediteur.
+ */
 export function updateExpediteur(cle: string, expediteur: string) {
   if (!cle) throw new Error("Aucune clé licence");
-  return putJSON("/api/licence/expediteur", { cle, expediteur });
+  return postJSON("/licence/expediteur", {
+    cle,
+    libelleExpediteur: expediteur,
+  });
 }
 
-/** MAJ signature: body = { cle, signature } */
+/** MAJ signature
+ *  Serveur: POST /licence/signature
+ *  Payload accepté: { cle?: string, licenceId?: string, signature: string, opticienId?: string }
+ */
 export function updateSignature(cle: string, signature: string) {
   if (!cle) throw new Error("Aucune clé licence");
-  return putJSON("/api/licence/signature", { cle, signature });
+  return postJSON("/licence/signature", {
+    cle,
+    signature,
+  });
 }
