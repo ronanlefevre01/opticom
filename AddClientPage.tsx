@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, Modal, View,
@@ -48,20 +48,19 @@ const appendSignature = (msg: string, sig: string) => {
   const s = (sig || '').trim();
   if (!s) return m;
   const norm = (x: string) => x.replace(/\s+/g, ' ').trim().toLowerCase();
-  if (norm(m).endsWith(norm(s)) || norm(m).includes(norm(' — ' + s))) return m;
-  const needsSpace = /[.!?]$/.test(m);
+  // évite doublons de signature
+  if (norm(m).endsWith(norm(s))) return m;
+  const needsSpace = /[.!?]\s*$/.test(m);
   const sep = needsSpace ? ' ' : ' — ';
   return `${m}${sep}${s}`;
 };
 
-/** Récupère (ou résout) un licenceId stable et le *cache* */
+/** Récupère (ou résout) un licenceId stable et le cache (AsyncStorage + ref) */
 const getStableLicenceId = async (): Promise<string | null> => {
   try {
-    // 1) cache direct
     const cached = await AsyncStorage.getItem('licenceId');
     if (cached) return cached;
 
-    // 2) objet de licence complet
     const licStr = await AsyncStorage.getItem('licence');
     if (!licStr) return null;
     const lic = JSON.parse(licStr);
@@ -71,10 +70,9 @@ const getStableLicenceId = async (): Promise<string | null> => {
       return String(lic.id);
     }
     if (lic?.licence) {
-      // Le serveur accepte ?key= ou ?cle=
       const r = await fetch(
-        `${SERVER_BASE}/api/licence/by-key?key=${encodeURIComponent(lic.licence)}`,
-        { headers: { Accept: 'application/json' } }
+        `${SERVER_BASE}/api/licence/by-key?key=${encodeURIComponent(lic.licence)}&_=${Date.now()}`,
+        { headers: { Accept: 'application/json' }, cache: 'no-store' }
       );
       if (r.ok) {
         const j = await r.json().catch(() => ({} as any));
@@ -85,9 +83,7 @@ const getStableLicenceId = async (): Promise<string | null> => {
         }
       }
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
   return null;
 };
 
@@ -107,7 +103,7 @@ const toServerClient = (local: any, stableId?: string) => {
     nom: String(local.nom || ''),
     phone: sanitizePhone(local.telephone || ''),
     email: String(local.email || ''),
-    naissance: local.dateNaissance || null,   // JJ/MM/AAAA
+    naissance: local.dateNaissance || null,
     lensStartDate: null,
     lensEndDate: null,
     lensDuration,
@@ -126,6 +122,19 @@ export default function AddClientPage() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
   const { mode, client }: RouteParams = route.params || {};
+
+  // cache mémoire (évite d’appeler getStableLicenceId plusieurs fois)
+  const licenceIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!licenceIdRef.current) {
+        const id = await getStableLicenceId();
+        if (alive) licenceIdRef.current = id;
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
 
   // Identité
   const [nom, setNom] = useState('');
@@ -164,7 +173,8 @@ export default function AddClientPage() {
   const [toast, setToast] = useState<{ visible: boolean; text: string }>({ visible: false, text: '' });
   const showToast = useCallback((text: string, ms = 1500) => {
     setToast({ visible: true, text });
-    setTimeout(() => setToast({ visible: false, text: '' }), ms);
+    const t = setTimeout(() => setToast({ visible: false, text: '' }), ms);
+    return () => clearTimeout(t);
   }, []);
 
   // Progress envoi SMS
@@ -233,7 +243,8 @@ export default function AddClientPage() {
     });
   }, [mode, client]);
 
-  const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>, value: boolean) => setter(!value);
+  const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>) =>
+    setter(prev => !prev);
 
   /** SAVE + SYNC SERVEUR */
   const handleSave = useCallback(async () => {
@@ -246,12 +257,9 @@ export default function AddClientPage() {
 
     // 1) Construire un client local (pour l’UI)
     const localClient: any = {
-      id: (client as any)?.id, // si on édite, on conserve l'id
-      nom,
-      prenom,
-      telephone: tel,
-      email,
-      dateNaissance, // JJ/MM/AAAA
+      id: (client as any)?.id,
+      nom, prenom, telephone: tel, email,
+      dateNaissance,
       lunettes,
       lentilles: [journ30 && '30j', journ60 && '60j', journ90 && '90j', mens6 && '6mois', mens12 && '1an'].filter(Boolean),
       consentementMarketing: consentMarketing,
@@ -276,7 +284,7 @@ export default function AddClientPage() {
       updatedAt: now,
     };
 
-    // 2) Sauvegarde locale immédiate (UX instantanée)
+    // 2) Sauvegarde locale immédiate
     try {
       const data = await AsyncStorage.getItem('clients');
       let clients: any[] = data ? JSON.parse(data) : [];
@@ -297,9 +305,10 @@ export default function AddClientPage() {
       return showToast('❌ Échec sauvegarde locale');
     }
 
-    // 3) Push serveur (synchro inter-postes)
+    // 3) Push serveur
     try {
-      const licenceId = await getStableLicenceId();
+      const licenceId = licenceIdRef.current || await getStableLicenceId();
+      licenceIdRef.current = licenceId;
       if (!licenceId) {
         console.warn('LicenceId introuvable → pas de synchro serveur');
         return;
@@ -360,8 +369,9 @@ export default function AddClientPage() {
     const message = (body || '').trim();
     if (!message) { showToast('❌ Message vide'); return false; }
 
-    const licenceId = await getStableLicenceId();
-    if (!licenceId) { showToast('❌ Licence introuvable'); return false; }
+    const id = licenceIdRef.current || await getStableLicenceId();
+    licenceIdRef.current = id;
+    if (!id) { showToast('❌ Licence introuvable'); return false; }
 
     setSending(true);
     setSendError(null);
@@ -372,7 +382,7 @@ export default function AddClientPage() {
       const response = await fetch(`${SERVER_BASE}/send-sms`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phoneNumber, message, licenceId }),
+        body: JSON.stringify({ phoneNumber, message, licenceId: id }),
       });
 
       const data = await response.json().catch(() => ({} as any));
@@ -389,7 +399,7 @@ export default function AddClientPage() {
       setSendError(errMsg);
       setSendStep('error');
       return false;
-    } catch (e) {
+    } catch {
       setSendError("Impossible d'envoyer le SMS (réseau).");
       setSendStep('error');
       return false;
@@ -410,9 +420,7 @@ export default function AddClientPage() {
         clients[idx].messagesEnvoyes.push({ type: templateKey, date: iso });
         await AsyncStorage.setItem('clients', JSON.stringify(clients));
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
   }, [telephone]);
 
   const sendTemplate = useCallback(async (templateKey: 'Lunettes' | 'SAV' | 'Lentilles' | 'Commande') => {
@@ -513,38 +521,38 @@ export default function AddClientPage() {
 
       {/* Consentements */}
       <Text style={[styles.subLabel, { marginTop: 20 }]}>Consentements SMS</Text>
-      <TouchableOpacity style={styles.checkbox} onPress={() => toggle(setConsentService, consentService)}>
+      <TouchableOpacity style={styles.checkbox} onPress={() => toggle(setConsentService)}>
         <Text style={styles.checkboxText}>{consentService ? '☑' : '☐'} Service (commande prête, SAV…)</Text>
       </TouchableOpacity>
-      <TouchableOpacity style={styles.checkbox} onPress={() => toggle(setConsentMarketing, consentMarketing)}>
+      <TouchableOpacity style={styles.checkbox} onPress={() => toggle(setConsentMarketing)}>
         <Text style={styles.checkboxText}>{consentMarketing ? '☑' : '☐'} Marketing (promos / relances)</Text>
       </TouchableOpacity>
 
       {/* Produits */}
       <Text style={styles.label}>Produits :</Text>
-      <TouchableOpacity style={styles.checkbox} onPress={() => toggle(setLunettes, lunettes)}>
+      <TouchableOpacity style={styles.checkbox} onPress={() => toggle(setLunettes)}>
         <Text style={styles.checkboxText}>{lunettes ? '☑' : '☐'} Lunettes</Text>
       </TouchableOpacity>
 
       <Text style={styles.subLabel}>Lentilles journalières :</Text>
       <View style={styles.row}>
-        <TouchableOpacity style={styles.checkboxInline} onPress={() => toggle(setJourn30, journ30)}>
+        <TouchableOpacity style={styles.checkboxInline} onPress={() => toggle(setJourn30)}>
           <Text style={styles.checkboxText}>{journ30 ? '☑' : '☐'} 30j</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.checkboxInline} onPress={() => toggle(setJourn60, journ60)}>
+        <TouchableOpacity style={styles.checkboxInline} onPress={() => toggle(setJourn60)}>
           <Text style={styles.checkboxText}>{journ60 ? '☑' : '☐'} 60j</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.checkboxInline} onPress={() => toggle(setJourn90, journ90)}>
+        <TouchableOpacity style={styles.checkboxInline} onPress={() => toggle(setJourn90)}>
           <Text style={styles.checkboxText}>{journ90 ? '☑' : '☐'} 90j</Text>
         </TouchableOpacity>
       </View>
 
       <Text style={styles.subLabel}>Lentilles mensuelles :</Text>
       <View style={styles.row}>
-        <TouchableOpacity style={styles.checkboxInline} onPress={() => toggle(setMens6, mens6)}>
+        <TouchableOpacity style={styles.checkboxInline} onPress={() => toggle(setMens6)}>
           <Text style={styles.checkboxText}>{mens6 ? '☑' : '☐'} 6 mois</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.checkboxInline} onPress={() => toggle(setMens12, mens12)}>
+        <TouchableOpacity style={styles.checkboxInline} onPress={() => toggle(setMens12)}>
           <Text style={styles.checkboxText}>{mens12 ? '☑' : '☐'} 1 an</Text>
         </TouchableOpacity>
       </View>
@@ -730,7 +738,7 @@ const styles = StyleSheet.create({
   },
   homeButtonText: { color: '#00BFFF', fontWeight: '600', fontSize: 16 },
 
-  // Modals (génériques)
+  // Modals
   modalOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)' },
   modalContent: { backgroundColor: '#222', padding: 24, borderRadius: 12, width: '85%', alignItems: 'center' },
   modalTitle: { color: '#fff', fontWeight: 'bold', fontSize: 16, marginBottom: 6 },

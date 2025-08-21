@@ -1,14 +1,13 @@
 // src/services/licence.ts
 import API_BASE from "@/config/api";
 
-/* --- helpers HTTP --- */
+/* http utils */
 async function getJSON(url: string) {
   const r = await fetch(url);
   const t = await r.text();
   if (!r.ok) throw new Error(`HTTP ${r.status}: ${t}`);
   return t ? JSON.parse(t) : {};
 }
-
 async function postJSON(path: string, body: any) {
   const r = await fetch(`${API_BASE}${path}`, {
     method: "POST",
@@ -20,14 +19,13 @@ async function postJSON(path: string, body: any) {
   return t ? JSON.parse(t) : {};
 }
 
-/* --- API licence (lecture) ---
-   Le serveur supporte /api/licence?cle=... ou ?id=... */
-export function fetchLicenceFromServer(cle: string) {
-  if (!cle) throw new Error("Aucune clé licence trouvée");
-  return getJSON(`${API_BASE}/api/licence?cle=${encodeURIComponent(cle)}`);
+/** Lecture licence — ?cle= ou ?id= */
+export function fetchLicenceFromServer(cleOrId: string, byId = false) {
+  const qs = byId ? `id=${encodeURIComponent(cleOrId)}` : `cle=${encodeURIComponent(cleOrId)}`;
+  return getJSON(`${API_BASE}/api/licence?${qs}`);
 }
 
-/* Résout l'ID interne à partir d'une clé, si besoin */
+/** Resolve ID from cle if needed */
 async function ensureLicenceId(opts: { licenceId?: string; cle?: string }) {
   if (opts.licenceId) return opts.licenceId;
   if (!opts.cle) throw new Error("Aucune clé licence");
@@ -37,37 +35,34 @@ async function ensureLicenceId(opts: { licenceId?: string; cle?: string }) {
   return id;
 }
 
-/* --- MAJ expéditeur ---
-   Serveur: POST /licence/expediteur
-   Payload: { licenceId, libelleExpediteur, opticienId? }
-*/
+/** MAJ expéditeur — serveur: POST /licence/expediteur */
 export async function updateExpediteur(
-  cleOrOpts: string | { licenceId?: string; cle?: string; opticienId?: string },
+  opts: { licenceId?: string; cle?: string; opticienId?: string },
   expediteur: string
 ) {
-  const opts =
-    typeof cleOrOpts === "string" ? { cle: cleOrOpts } : cleOrOpts || {};
   const licenceId = await ensureLicenceId(opts);
+  // On envoie TOUT: id + cle + 2 noms de champ (compat v1/v2)
   const body: any = {
     licenceId,
+    cle: opts.cle,
     libelleExpediteur: expediteur,
+    expediteur, // compat anciennes routes
   };
   if (opts.opticienId) body.opticienId = opts.opticienId;
   return postJSON("/licence/expediteur", body);
 }
 
-/* --- MAJ signature ---
-   Serveur: POST /licence/signature
-   Payload: { licenceId, signature, opticienId? }
-*/
+/** MAJ signature — serveur: POST /licence/signature */
 export async function updateSignature(
-  cleOrOpts: string | { licenceId?: string; cle?: string; opticienId?: string },
+  opts: { licenceId?: string; cle?: string; opticienId?: string },
   signature: string
 ) {
-  const opts =
-    typeof cleOrOpts === "string" ? { cle: cleOrOpts } : cleOrOpts || {};
   const licenceId = await ensureLicenceId(opts);
-  const body: any = { licenceId, signature };
+  const body: any = {
+    licenceId,
+    cle: opts.cle,
+    signature,
+  };
   if (opts.opticienId) body.opticienId = opts.opticienId;
   return postJSON("/licence/signature", body);
 }

@@ -10,10 +10,10 @@ import { Client, SMSCategory } from './types';
 import { NavigationProps } from './navigationTypes';
 import API_BASE from './src/config/api';
 
-const SEND_SMS_ENDPOINT = `${API_BASE}/send-sms`;
+// ✅ utilise le service avec cache + dédoublonnage
+import { getClients as getClientsFromService } from './src/sync/clientSync';
 
-// ---------- Anti-spam sync ----------
-const CLIENTS_SYNC_COOLDOWN_MS = 120_000; // 2 minutes
+const SEND_SMS_ENDPOINT = `${API_BASE}/send-sms`;
 
 /* ------------ helpers ------------- */
 const sanitizePhone = (raw: string) => {
@@ -21,106 +21,18 @@ const sanitizePhone = (raw: string) => {
   if (p.startsWith('+33')) p = '0' + p.slice(3);
   return p.replace(/\D/g, '');
 };
-const toE164FR = (p10: string) => (p10 && p10.startsWith('0') ? `+33${p10.slice(1)}` : p10);
 const isPhone10 = (p: string) => /^\d{10}$/.test(p);
 
-// FIX: clés AsyncStorage pour tombstones (clients supprimés) et resets d’historique
-const KEY_CLIENT_TOMBSTONES = 'clients.tombstones';
-const KEY_SMS_HISTORY_RESETS = 'smsHistory.resets';
-
-async function loadTombstones(): Promise<string[]> {
-  try {
-    const raw = await AsyncStorage.getItem(KEY_CLIENT_TOMBSTONES);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
-}
-async function saveTombstones(list: string[]) {
-  try { await AsyncStorage.setItem(KEY_CLIENT_TOMBSTONES, JSON.stringify(Array.from(new Set(list)))); } catch {}
-}
-async function addTombstone(phoneKey: string) {
-  const list = await loadTombstones();
-  if (!list.includes(phoneKey)) { list.push(phoneKey); await saveTombstones(list); }
-}
-
-type ResetMap = Record<string, string>; // phone -> ISO date
-async function loadHistoryResets(): Promise<ResetMap> {
-  try {
-    const raw = await AsyncStorage.getItem(KEY_SMS_HISTORY_RESETS);
-    const obj = raw ? JSON.parse(raw) : {};
-    return obj && typeof obj === 'object' ? obj : {};
-  } catch { return {}; }
-}
-async function saveHistoryResets(map: ResetMap) {
-  try { await AsyncStorage.setItem(KEY_SMS_HISTORY_RESETS, JSON.stringify(map)); } catch {}
-}
-
-const getLicenceFromStorage = async (): Promise<{ licenceId: string | null; cle: string | null }> => {
-  try {
-    const raw = await AsyncStorage.getItem('licence');
-    if (!raw) return { licenceId: null, cle: null };
-    const lic = JSON.parse(raw);
-    const licenceId = String(lic?.id || '').trim() || null;
-    const cle = String(lic?.licence || '').trim() || null;
-    return { licenceId, cle };
-  } catch {
-    return { licenceId: null, cle: null };
-  }
+// E.164 FR
+const toE164FR = (raw: string) => {
+  const p = sanitizePhone(raw);
+  if (/^0\d{9}$/.test(p)) return '+33' + p.slice(1);
+  if (p.startsWith('+33')) return p;
+  if (/^33\d{9}$/.test(p)) return '+' + p;
+  return p;
 };
 
-/** Résout un licenceId fiable (si on n’a que la clé) */
-const resolveLicenceId = async (): Promise<string | null> => {
-  const { licenceId, cle } = await getLicenceFromStorage();
-  if (licenceId) return licenceId;
-  if (!cle) return null;
-
-  const candidates = [
-    `${API_BASE}/api/licence?cle=${encodeURIComponent(cle)}`,
-    `${API_BASE}/licence?cle=${encodeURIComponent(cle)}`,
-    `${API_BASE}/api/licence/by-key?cle=${encodeURIComponent(cle)}`,
-    `${API_BASE}/licence/by-key?cle=${encodeURIComponent(cle)}`,
-  ];
-  for (const url of candidates) {
-    try {
-      const res = await fetch(url);
-      const text = await res.text();
-      if (!res.ok) continue;
-      const data = JSON.parse(text);
-      const id = data?.licence?.id || data?.id || data?.licence?.opticien?.id;
-      if (id) return String(id);
-    } catch {}
-  }
-  return null;
-};
-
-const getSignatureFromSettings = async (): Promise<string> => {
-  try {
-    const licStr = await AsyncStorage.getItem('licence');
-    if (licStr) {
-      const lic = JSON.parse(licStr);
-      if (typeof lic?.signature === 'string' && lic.signature.trim().length > 0) {
-        return lic.signature.trim();
-      }
-    }
-    const localSig = await AsyncStorage.getItem('signature');
-    return (localSig || '').trim();
-  } catch {
-    return '';
-  }
-};
-
-const appendSignature = (msg: string, sig: string) => {
-  const m = (msg || '').trim();
-  const s = (sig || '').trim();
-  if (!s) return m;
-  const norm = (x: string) => x.replace(/\s+/g, ' ').trim().toLowerCase();
-  if (norm(m).endsWith(norm(s)) || norm(m).includes(norm(' — ' + s))) return m;
-  const needsSpace = /[.!?]$/.test(m);
-  const sep = needsSpace ? ' ' : ' — ';
-  return `${m}${sep}${s}`;
-};
-
-/* confirm cross-platform (Web/Native) */
+// confirm cross-platform (Web/Native)
 const confirmAsync = (title: string, message: string, okText = 'Supprimer') =>
   new Promise<boolean>((resolve) => {
     if (Platform.OS === 'web') {
@@ -134,146 +46,72 @@ const confirmAsync = (title: string, message: string, okText = 'Supprimer') =>
     }
   });
 
-/** ✅ Lit les crédits directement depuis la licence (JSONBin) */
-const fetchCreditsFromServer = async (licenceId: string): Promise<number | null> => {
-  const urls = [
-    `${API_BASE}/api/licence?id=${encodeURIComponent(licenceId)}`,
-    `${API_BASE}/licence?id=${encodeURIComponent(licenceId)}`,
-  ];
-  for (const url of urls) {
-    try {
-      const res = await fetch(url);
-      const text = await res.text();
-      if (!res.ok) continue;
-      const data = JSON.parse(text);
-      const lic = data?.licence ?? data;
-      const credits = lic?.credits;
-      if (typeof credits === 'number') return credits;
-    } catch {}
-  }
-  // fallbacks éventuels
-  const fallbacks = [
-    `${API_BASE}/licence/credits?licenceId=${encodeURIComponent(licenceId)}`,
-    `${API_BASE}/licence-credits?licenceId=${encodeURIComponent(licenceId)}`,
-    `${API_BASE}/credits?licenceId=${encodeURIComponent(licenceId)}`,
-  ];
-  for (const url of fallbacks) {
-    try {
-      const res = await fetch(url);
-      const text = await res.text();
-      if (!res.ok) continue;
-      const data = JSON.parse(text);
-      const credits = data?.credits ?? data?.remaining ?? data?.solde ?? (typeof data === 'number' ? data : null);
-      if (typeof credits === 'number') return credits;
-    } catch {}
-  }
-  return null;
-};
-
-const FILTER_TYPES: (SMSCategory | 'Tous')[] = ['Tous', 'Lunettes', 'Lentilles', 'SAV', 'Commande'];
-
-const DEFAULT_TEMPLATES: Record<SMSCategory, string> = {
-  Lunettes:  'Bonjour {prenom} {nom}, vos lunettes sont prêtes. À bientôt !',
-  SAV:       'Bonjour {prenom} {nom}, votre SAV est terminé, vous pouvez venir le récupérer.',
-  Lentilles: 'Bonjour {prenom} {nom}, vos lentilles sont disponibles en magasin.',
-  Commande:  'Bonjour {prenom} {nom}, votre commande est arrivée !',
-};
-
-/** ---- parsing & mapping clients serveur -> local ---- */
-const extractServerItems = (payload: any): any[] => {
-  if (!payload) return [];
-  if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload.items)) return payload.items;
-  if (payload.clients && Array.isArray(payload.clients)) return payload.clients;
-  return [];
-};
-
-const serverToLocalClient = (s: any): Client => {
-  const phone = sanitizePhone(s.phone || s.telephone || '');
-  const lentilles: string[] = [];
-  const dur = String(s.lensDuration || '').toLowerCase();
-  if (dur === '30j') lentilles.push('30j');
-  if (dur === '60j') lentilles.push('60j');
-  if (dur === '90j') lentilles.push('90j');
-  if (dur === '6mois') lentilles.push('6mois');
-  if (dur === '1an') lentilles.push('1an');
-
-  return {
-    id: s.id || `srv-${phone}`,
-    prenom: s.prenom || '',
-    nom: s.nom || '',
-    telephone: phone,
-    email: s.email || '',
-    dateNaissance: s.naissance || '',
-    lunettes: !!s.lunettes,
-    lentilles,
-    consentementMarketing: !!s.consentementMarketing,
-    consent: s.consent || {
-      service_sms: { value: true },
-      marketing_sms: { value: !!s.consentementMarketing },
-    },
-    messagesEnvoyes: Array.isArray(s.messagesEnvoyes) ? s.messagesEnvoyes : [],
-    createdAt: s.createdAt || new Date().toISOString(),
-  } as Client;
-};
-
-/** Merge serveur + local par téléphone (on garde l’historique local) */
-const mergeLocalWithServer = (local: Client[], server: Client[]) => {
-  const byPhone = new Map<string, Client>();
-  for (const c of server) byPhone.set(sanitizePhone(c.telephone), c);
-
-  const merged: Client[] = [];
-
-  // Inject serveur, en fusionnant historique depuis local
-  for (const s of server) {
-    const key = sanitizePhone(s.telephone);
-    const l = local.find((x) => sanitizePhone(x.telephone) === key);
-    if (l && Array.isArray(l.messagesEnvoyes) && l.messagesEnvoyes.length) {
-      const seen = new Set((Array.isArray(s.messagesEnvoyes) ? s.messagesEnvoyes : []).map((m: any) => `${m.type}|${m.date}`));
-      const out = Array.isArray(s.messagesEnvoyes) ? [...s.messagesEnvoyes] : [];
-      for (const m of l.messagesEnvoyes) {
-        const id = `${m.type}|${m.date}`;
-        if (!seen.has(id)) out.push(m);
+const getSignatureFromSettings = async (): Promise<string> => {
+  try {
+    const licStr = await AsyncStorage.getItem('licence');
+    if (licStr) {
+      const lic = JSON.parse(licStr);
+      if (typeof lic?.signature === 'string' && lic.signature.trim()) {
+        return lic.signature.trim();
       }
-      merged.push({ ...s, messagesEnvoyes: out });
-    } else {
-      merged.push(s);
     }
+    const localSig = await AsyncStorage.getItem('signature');
+    return (localSig || '').trim();
+  } catch {
+    return '';
   }
-
-  // Ajoute locaux “non présents serveur”
-  for (const l of local) {
-    const key = sanitizePhone(l.telephone);
-    if (!byPhone.has(key)) merged.push(l);
-  }
-
-  return merged;
+};
+const appendSignature = (msg: string, sig: string) => {
+  const m = (msg || '').trim();
+  const s = (sig || '').trim();
+  if (!s) return m;
+  const norm = (x: string) => x.replace(/\s+/g, ' ').trim().toLowerCase();
+  if (norm(m).endsWith(norm(s)) || norm(m).includes(norm(' — ' + s))) return m;
+  const needsSpace = /[.!?]$/.test(m);
+  const sep = needsSpace ? ' ' : ' — ';
+  return `${m}${sep}${s}`;
 };
 
-/** GET clients depuis serveur (avec fallbacks d’URL) */
-const fetchClientsFromServer = async (licenceId: string): Promise<Client[] | null> => {
-  const urls = [
-    `${API_BASE}/api/clients?licenceId=${encodeURIComponent(licenceId)}`,
-    `${API_BASE}/clients?licenceId=${encodeURIComponent(licenceId)}`,
-    `${API_BASE}/licence/clients?licenceId=${encodeURIComponent(licenceId)}`,
-  ];
-  for (const url of urls) {
-    try {
-      const res = await fetch(url);
-      const text = await res.text();
-      if (!res.ok) continue;
-      const data = JSON.parse(text);
-      const items = extractServerItems(data);
-      if (!Array.isArray(items)) continue;
-      return items.map(serverToLocalClient);
-    } catch {}
-  }
+/** ✅ Résout un licenceId stable et le *cache* (évite les requêtes répétées) */
+const getStableLicenceId = async (): Promise<string | null> => {
+  try {
+    const cached = await AsyncStorage.getItem('licenceId');
+    if (cached) return cached;
+
+    const licStr = await AsyncStorage.getItem('licence');
+    if (!licStr) return null;
+    const lic = JSON.parse(licStr);
+
+    if (lic?.id) {
+      await AsyncStorage.setItem('licenceId', String(lic.id));
+      return String(lic.id);
+    }
+    if (lic?.licence) {
+      const urls = [
+        `${API_BASE}/api/licence/by-key?key=${encodeURIComponent(lic.licence)}`,
+        `${API_BASE}/licence/by-key?key=${encodeURIComponent(lic.licence)}`,
+        `${API_BASE}/api/licence?cle=${encodeURIComponent(lic.licence)}`,
+        `${API_BASE}/licence?cle=${encodeURIComponent(lic.licence)}`
+      ];
+      for (const url of urls) {
+        try {
+          const r = await fetch(url, { headers: { Accept: 'application/json' } });
+          if (!r.ok) continue;
+          const j = await r.json().catch(() => ({} as any));
+          const id = j?.licence?.id || j?.id;
+          if (id) {
+            await AsyncStorage.setItem('licenceId', String(id));
+            return String(id);
+          }
+        } catch {}
+      }
+    }
+  } catch {}
   return null;
 };
 
 /** ---- Historique SMS depuis la licence (JSONBin) ---- */
-type ServerSmsItem = { date: string; type: string; numero: string; emetteur?: string; textHash?: string };
-
+type ServerSmsItem = { date: string; type: string; numero: string };
 const labelFromType = (t: string) => {
   if (t === 'marketing') return 'Marketing';
   if (t === 'transactional') return 'Transactionnel';
@@ -281,11 +119,9 @@ const labelFromType = (t: string) => {
   if (t === 'auto-renew') return 'Renouvellement auto';
   return 'SMS';
 };
-
-/** ✅ Récupère { licence } puis retourne licence.historiqueSms[] */
-const fetchSmsHistoryFromLicence = async (licenceId: string, cle: string | null): Promise<ServerSmsItem[]> => {
+const fetchSmsHistoryFromLicence = async (licenceId: string, cle?: string | null): Promise<ServerSmsItem[]> => {
   const urls: string[] = [
-    `${API_BASE}/api/licence?id=${encodeURIComponent(licenceId)}`,
+    `${API_BASE}/api/licence?id=${encodeURIComponent(licenceId)}`
   ];
   if (cle) {
     urls.push(
@@ -307,13 +143,78 @@ const fetchSmsHistoryFromLicence = async (licenceId: string, cle: string | null)
   return [];
 };
 
+/* ---- mapping service row -> Client local ---- */
+type ClientRow = {
+  id: string;
+  prenom?: string;
+  nom?: string;
+  phone?: string;
+  telephone?: string;
+  email?: string;
+  updatedAt?: string;
+  deletedAt?: string | null;
+};
+const rowToClient = (s: ClientRow): Client => ({
+  id: s.id,
+  prenom: s.prenom || '',
+  nom: s.nom || '',
+  telephone: sanitizePhone(s.telephone || s.phone || ''),
+  email: s.email || '',
+  dateNaissance: '', // non exposé par le service
+  lunettes: false,
+  lentilles: [],
+  consentementMarketing: false,
+  consent: { service_sms: { value: true }, marketing_sms: { value: false } },
+  messagesEnvoyes: [],
+  createdAt: s.updatedAt || new Date().toISOString(),
+});
+
+/* ---- tombstones & resets locaux ---- */
+const KEY_CLIENT_TOMBSTONES = 'clients.tombstones';           // téléphones sanitisés
+const KEY_SMS_HISTORY_RESETS = 'smsHistory.resets';           // phone -> ISO date
+type ResetMap = Record<string, string>;
+
+async function loadTombstones(): Promise<string[]> {
+  try {
+    const raw = await AsyncStorage.getItem(KEY_CLIENT_TOMBSTONES);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+}
+async function saveTombstones(list: string[]) {
+  try { await AsyncStorage.setItem(KEY_CLIENT_TOMBSTONES, JSON.stringify(Array.from(new Set(list)))); } catch {}
+}
+async function addTombstone(phoneKey: string) {
+  const list = await loadTombstones();
+  if (!list.includes(phoneKey)) { list.push(phoneKey); await saveTombstones(list); }
+}
+async function loadHistoryResets(): Promise<ResetMap> {
+  try {
+    const raw = await AsyncStorage.getItem(KEY_SMS_HISTORY_RESETS);
+    const obj = raw ? JSON.parse(raw) : {};
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch { return {}; }
+}
+async function saveHistoryResets(map: ResetMap) {
+  try { await AsyncStorage.setItem(KEY_SMS_HISTORY_RESETS, JSON.stringify(map)); } catch {}
+}
+
+/* ---- templates / filtres ---- */
+const FILTER_TYPES: (SMSCategory | 'Tous')[] = ['Tous', 'Lunettes', 'Lentilles', 'SAV', 'Commande'];
+const DEFAULT_TEMPLATES: Record<SMSCategory, string> = {
+  Lunettes:  'Bonjour {prenom} {nom}, vos lunettes sont prêtes. À bientôt !',
+  SAV:       'Bonjour {prenom} {nom}, votre SAV est terminé, vous pouvez venir le récupérer.',
+  Lentilles: 'Bonjour {prenom} {nom}, vos lentilles sont disponibles en magasin.',
+  Commande:  'Bonjour {prenom} {nom}, votre commande est arrivée !',
+};
+
 export default function ClientListPage() {
   const navigation = useNavigation<NavigationProps>();
 
   const [clients, setClients] = useState<Client[]>([]);
   const [filteredClients, setFilteredClients] = useState<Client[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedClients, setSelectedClients] = useState<string[]>([]); // téléphones sanitisés
+  const [selectedClients, setSelectedClients] = useState<string[]>([]);
   const [smsFilter, setSmsFilter] = useState<SMSCategory | 'Tous'>('Tous');
 
   const [customMessages, setCustomMessages] = useState<Record<string, string | { title?: string; content: string }>>({});
@@ -332,77 +233,77 @@ export default function ClientListPage() {
   // modale choix de type
   const [typeModalVisible, setTypeModalVisible] = useState(false);
 
-  // sync state
+  // sync state / garde-fou
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
-
-  // anti-spam (verrou + cooldown)
-  const lastSyncRef = useRef(0);
   const inFlightRef = useRef(false);
 
+  /** ---- SYNCHRO (1 seule requête grâce au service) ---- */
   const syncFromServer = useCallback(async (force = false) => {
-    if (inFlightRef.current) return; // déjà en cours
-    const now = Date.now();
-    if (!force && now - lastSyncRef.current < CLIENTS_SYNC_COOLDOWN_MS) return;
-
+    if (inFlightRef.current) return;
     inFlightRef.current = true;
     try {
       setSyncing(true);
       setSyncError(null);
 
-      const { licenceId: storedId, cle } = await getLicenceFromStorage();
-      const licenceId = storedId || (await resolveLicenceId());
-      if (!licenceId) {
-        setSyncError('Licence introuvable');
-        return;
-      }
+      // licenceId stable
+      const licStr = await AsyncStorage.getItem('licence');
+      const lic = licStr ? JSON.parse(licStr) : null;
+      const cle = String(lic?.licence || '').trim() || null;
+      const licenceId = await getStableLicenceId();
+      if (!licenceId) { setSyncError('Licence introuvable'); return; }
 
-      // 0) Charger tombstones et resets (local)
+      // tombstones & resets (local)
       const [tombstones, resets] = await Promise.all([loadTombstones(), loadHistoryResets()]);
       const tombstoneSet = new Set(tombstones);
 
-      // 1) Clients
-      const remote = await fetchClientsFromServer(licenceId);
-      if (!remote) {
-        setSyncError('Serveur indisponible');
-        return;
-      }
+      // 1) Clients via service (cache TTL 15 s + dédoublonnage)
+      const rows = await getClientsFromService(licenceId, force);
+      const remote = (rows || [])
+        .filter(r => !r.deletedAt) // sécurité
+        .map(rowToClient)
+        .filter(c => !tombstoneSet.has(sanitizePhone(c.telephone)));
 
-      // 1bis) Appliquer tombstones locaux (anti-résurrection)
-      const remoteFiltered = remote.filter(c => !tombstoneSet.has(sanitizePhone(c.telephone)));
-
-      // 2) Historique via { licence }.historiqueSms
-      const licenceHistory = await fetchSmsHistoryFromLicence(licenceId, cle);
-
-      // 3) Indexer l’historique par téléphone (et ignorer ceux reset localement)
+      // 2) Historique de la licence (une seule requête)
+      const hist = await fetchSmsHistoryFromLicence(licenceId, cle);
       const byPhone = new Map<string, { date: string; type: string }[]>();
-      for (const h of licenceHistory) {
+      for (const h of hist) {
         const key = sanitizePhone(h.numero || '');
         if (!key) continue;
-        if (resets[key]) continue; // FIX: l’historique a été réinitialisé localement → on ignore ce numéro
+        // ignore ce qui est antérieur au reset local éventuel
+        const resetAt = resets[key];
+        if (resetAt && new Date(h.date) <= new Date(resetAt)) continue;
         if (!byPhone.has(key)) byPhone.set(key, []);
         byPhone.get(key)!.push({ date: h.date, type: labelFromType(h.type) });
       }
 
-      // 4) Injecter l’historique serveur (filtré par resets) dans les clients
-      const remoteWithHistory = (remoteFiltered || []).map(c => {
-        const key = sanitizePhone(c.telephone);
-        const logs = byPhone.get(key) || [];
-        const prev = Array.isArray(c.messagesEnvoyes) ? c.messagesEnvoyes : [];
-        const seen = new Set(prev.map((m: any) => `${m.type}|${m.date}`));
-        const mergedLogs = [...prev];
-        for (const m of logs) {
-          const id = `${m.type}|${m.date}`;
-          if (!seen.has(id)) mergedLogs.push({ type: m.type as any, date: m.date });
-        }
-        return { ...c, messagesEnvoyes: mergedLogs };
+      // 3) Injecter l’historique
+      const withHistory = remote.map(c => {
+        const logs = byPhone.get(sanitizePhone(c.telephone)) || [];
+        return { ...c, messagesEnvoyes: logs };
       });
 
-      // 5) Merger avec le local
+      // 4) Merger avec local (préserve histor. local si besoin)
       const localStr = await AsyncStorage.getItem('clients');
       const local: Client[] = localStr ? JSON.parse(localStr) : [];
-      const merged = mergeLocalWithServer(local, remoteWithHistory)
-        .filter(c => !tombstoneSet.has(sanitizePhone(c.telephone))); // sécurité
+      const mergedByPhone = new Map<string, Client>();
+      for (const s of withHistory) mergedByPhone.set(sanitizePhone(s.telephone), s);
+      for (const l of local) {
+        const key = sanitizePhone(l.telephone);
+        if (!mergedByPhone.has(key)) mergedByPhone.set(key, l);
+        else {
+          // fusion messagesEnvoyes
+          const cur = mergedByPhone.get(key)!;
+          const seen = new Set((cur.messagesEnvoyes || []).map(m => `${m.type}|${m.date}`));
+          const out = [...(cur.messagesEnvoyes || [])];
+          for (const m of (l.messagesEnvoyes || [])) {
+            const id = `${m.type}|${m.date}`;
+            if (!seen.has(id)) out.push(m);
+          }
+          mergedByPhone.set(key, { ...cur, messagesEnvoyes: out });
+        }
+      }
+      const merged = Array.from(mergedByPhone.values());
 
       await AsyncStorage.setItem('clients', JSON.stringify(merged));
       setClients(merged);
@@ -410,15 +311,14 @@ export default function ClientListPage() {
     } catch (e: any) {
       setSyncError(e?.message || 'Erreur inconnue');
     } finally {
-      lastSyncRef.current = Date.now();
       inFlightRef.current = false;
       setSyncing(false);
     }
   }, []);
 
-  // Chargement local + 1ère synchro forcée au montage
+  // Chargement local + première synchro (force) au montage
   useEffect(() => {
-    const loadData = async () => {
+    (async () => {
       const clientData = await AsyncStorage.getItem('clients');
       const messageData = await AsyncStorage.getItem('messages');
       if (clientData) {
@@ -429,9 +329,8 @@ export default function ClientListPage() {
       if (messageData) {
         try { setCustomMessages(JSON.parse(messageData)); } catch {}
       }
-      await syncFromServer(true); // <- synchro unique au démarrage
-    };
-    loadData();
+      await syncFromServer(true); // ⬅️ une seule fois au démarrage
+    })();
   }, [syncFromServer]);
 
   // Filtrage recherche / type
@@ -458,7 +357,7 @@ export default function ClientListPage() {
     );
   };
 
-  // FIX: suppression côté serveur (DELETE), avec tombstone local si échec
+  // suppression (DELETE côté serveur) + tombstone local si échec
   const deleteClient = async (rawPhone: string) => {
     const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est définitive.');
     if (!ok) return;
@@ -474,124 +373,82 @@ export default function ClientListPage() {
     setSelectedClients(prev => prev.filter(t => t !== phone));
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
 
-    // Serveur
     try {
-      const licId = (await resolveLicenceId()) || (await getLicenceFromStorage()).licenceId;
-      if (!licId) throw new Error('LICENCE_ID_MISSING');
+      const licenceId = await getStableLicenceId();
+      if (!licenceId) throw new Error('LICENCE_ID_MISSING');
 
       if (targetId) {
-        const del = await fetch(`${API_BASE}/api/clients/${encodeURIComponent(String(targetId))}?licenceId=${encodeURIComponent(licId)}`, {
+        const del = await fetch(`${API_BASE}/api/clients/${encodeURIComponent(String(targetId))}?licenceId=${encodeURIComponent(licenceId)}`, {
           method: 'DELETE',
         });
         if (!del.ok) throw new Error(`HTTP ${del.status}`);
       } else {
-        // pas d’ID serveur : pousse une tombstone via upsert
+        // pas d’ID serveur : pousse une tombstone via upsert minimal
         await fetch(`${API_BASE}/api/clients/upsert`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            licenceId: licId,
+            licenceId,
             clients: [{ id: `loc-${phone}`, phone, telephone: phone, updatedAt: new Date().toISOString(), deletedAt: new Date().toISOString() }],
           }),
         });
       }
     } catch {
-      // garde un tombstone local pour éviter la résurrection aux prochains syncs
       await addTombstone(phone);
     }
   };
 
-  // FIX: reset historique — tente serveur, sinon marqueur local (resets)
-  // --- helpers pour le reset anti-retour (stocké localement) ---
-const HISTORY_RESET_KEY = 'smsHistoryResets';
-type HistoryResetMap = Record<string, string>; // phone -> ISO timestamp
+  // reset historique — purge serveur si possible + marqueur local anti-retour
+  const resetClientHistory = async (rawPhone: string) => {
+    const ok = await confirmAsync(
+      'Réinitialiser l’historique ?',
+      'Effacer l’historique des SMS de ce client ?',
+      'Réinitialiser'
+    );
+    if (!ok) return;
 
-const loadHistoryResets = async (): Promise<HistoryResetMap> => {
-  try {
-    const raw = await AsyncStorage.getItem(HISTORY_RESET_KEY);
-    const j = raw ? JSON.parse(raw) : {};
-    return j && typeof j === 'object' ? j : {};
-  } catch {
-    return {};
-  }
-};
-const saveHistoryResets = async (map: HistoryResetMap) => {
-  try { await AsyncStorage.setItem(HISTORY_RESET_KEY, JSON.stringify(map)); } catch {}
-};
+    const phone = sanitizePhone(rawPhone);
 
-// --- normalisation en E.164 FR (+33XXXXXXXXX) ---
-const toE164FR = (raw: string) => {
-  const p = sanitizePhone(raw);
-  if (/^0\d{9}$/.test(p)) return '+33' + p.slice(1);
-  if (p.startsWith('+33')) return p;
-  if (/^33\d{9}$/.test(p)) return '+' + p;
-  // à défaut on renvoie le sanitized (le serveur renormalisera)
-  return p;
-};
+    // purge locale immédiate
+    const updated = clients.map((c) =>
+      sanitizePhone(c.telephone) === phone ? { ...c, messagesEnvoyes: [] } : c
+    );
+    setClients(updated);
+    setFilteredClients(updated);
+    await AsyncStorage.setItem('clients', JSON.stringify(updated));
 
-// --- fonction principale corrigée ---
-const resetClientHistory = async (rawPhone: string) => {
-  const ok = await confirmAsync(
-    'Réinitialiser l’historique ?',
-    'Effacer l’historique des SMS de ce client ?',
-    'Réinitialiser'
-  );
-  if (!ok) return;
+    // marqueur anti-retour
+    const resets = await loadHistoryResets();
+    resets[phone] = new Date().toISOString();
+    await saveHistoryResets(resets);
 
-  const phone = sanitizePhone(rawPhone);
+    // tentative purge serveur
+    try {
+      const licenceId = await getStableLicenceId();
+      if (!licenceId) throw new Error('LICENCE_ID_MISSING');
+      const numero = toE164FR(phone);
 
-  // 1) purge locale immédiate
-  const updated = clients.map((c) =>
-    sanitizePhone(c.telephone) === phone ? { ...c, messagesEnvoyes: [] } : c
-  );
-  setClients(updated);
-  setFilteredClients(updated);
-  await AsyncStorage.setItem('clients', JSON.stringify(updated));
-
-  // 2) marqueur anti-retour (si le serveur ne purge pas, on n’affichera pas ce qui est plus ancien)
-  const resets = await loadHistoryResets();
-  resets[phone] = new Date().toISOString();
-  await saveHistoryResets(resets);
-
-  // 3) tentative de purge côté serveur (facultatif mais idéal)
-  try {
-    const { licenceId: storedId } = await getLicenceFromStorage();
-    const licId = storedId || (await resolveLicenceId());
-    if (!licId) throw new Error('LICENCE_ID_MISSING');
-
-    const numero = toE164FR(phone);
-    const tries = [
-      { url: `${API_BASE}/api/sms-history/erase-for-number`, body: { licenceId: licId, numero } },
-      { url: `${API_BASE}/api/sms-history/erase`,           body: { licenceId: licId, numero } },
-      { url: `${API_BASE}/licence/history/erase-for-number`, body: { licenceId: licId, numero } },
-      { url: `${API_BASE}/api/licence/history/erase`,        body: { licenceId: licId, numero } },
-    ];
-
-    let okSrv = false;
-    for (const t of tries) {
-      try {
-        const r = await fetch(t.url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(t.body),
-        });
-        const j = await r.json().catch(() => ({}));
-        if (r.ok && (j?.ok === true || j?.removed >= 0)) { okSrv = true; break; }
-      } catch {
-        // ignore et on tente l’URL suivante
+      const tries = [
+        { url: `${API_BASE}/api/sms-history/erase-for-number`, body: { licenceId, numero } },
+        { url: `${API_BASE}/api/sms-history/erase`,           body: { licenceId, numero } },
+        { url: `${API_BASE}/licence/history/erase-for-number`, body: { licenceId, numero } },
+        { url: `${API_BASE}/api/licence/history/erase`,        body: { licenceId, numero } },
+      ];
+      for (const t of tries) {
+        try {
+          const r = await fetch(t.url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(t.body),
+          });
+          const j = await r.json().catch(() => ({}));
+          if (r.ok && (j?.ok === true || j?.removed >= 0)) break;
+        } catch {}
       }
-    }
-    if (!okSrv) {
-      // Pas grave : le marqueur local empêche la réapparition à la prochaine sync.
-      // Tu peux afficher un toast si tu veux prévenir l’utilisateur.
-      console.warn('Purge serveur non confirmée — fallback local actif.');
-    }
-  } catch (e) {
-    console.warn('Purge serveur impossible — fallback local actif.', e);
-  }
-};
+    } catch {}
+  };
 
-
+  /* --------- Envoi SMS --------- */
   const getTemplateString = (key: SMSCategory) => {
     const v = customMessages[key];
     if (typeof v === 'string') return v || DEFAULT_TEMPLATES[key];
@@ -600,7 +457,6 @@ const resetClientHistory = async (rawPhone: string) => {
     }
     return DEFAULT_TEMPLATES[key];
   };
-
   const buildMessageForClient = (tpl: string, c: Client) =>
     (tpl || 'Bonjour, votre opticien vous contacte.')
       .replace('{prenom}', c.prenom || '')
@@ -610,7 +466,6 @@ const resetClientHistory = async (rawPhone: string) => {
       .replace(/\s+/g, ' ')
       .trim();
 
-  /* --------- Choix type (modale) --------- */
   const openSmsDialog = () => {
     if (selectedClients.length === 0) {
       Alert.alert('Info', 'Sélectionne au moins un client.');
@@ -619,10 +474,9 @@ const resetClientHistory = async (rawPhone: string) => {
     setTypeModalVisible(true);
   };
 
-  // n’envoie que si on a un licenceId (le backend n’accepte pas la clé)
-  const sendOne = async ({
-    licenceId, phoneNumber, message,
-  }: { licenceId: string; phoneNumber: string; message: string; }) => {
+  const sendOne = async ({ licenceId, phoneNumber, message }:{
+    licenceId: string; phoneNumber: string; message: string;
+  }) => {
     const payload: any = { phoneNumber, message, licenceId };
     const resp = await fetch(SEND_SMS_ENDPOINT, {
       method: 'POST',
@@ -637,6 +491,25 @@ const resetClientHistory = async (rawPhone: string) => {
     return true;
   };
 
+  const fetchCreditsFromServer = async (licenceId: string): Promise<number | null> => {
+    const urls = [
+      `${API_BASE}/api/licence?id=${encodeURIComponent(licenceId)}`,
+      `${API_BASE}/licence?id=${encodeURIComponent(licenceId)}`
+    ];
+    for (const url of urls) {
+      try {
+        const r = await fetch(url);
+        const t = await r.text();
+        if (!r.ok) continue;
+        const j = JSON.parse(t);
+        const lic = j?.licence ?? j;
+        const credits = lic?.credits;
+        if (typeof credits === 'number') return credits;
+      } catch {}
+    }
+    return null;
+  };
+
   const sendBatch = async (category: SMSCategory | '__custom__') => {
     const batch = clients.filter((c) => selectedClients.includes(sanitizePhone(c.telephone)));
     if (batch.length === 0) {
@@ -644,14 +517,13 @@ const resetClientHistory = async (rawPhone: string) => {
       return;
     }
 
-    const { licenceId: storedId } = await getLicenceFromStorage();
-    const resolvedId = storedId || (await resolveLicenceId());
-    if (!resolvedId) {
+    const licenceId = await getStableLicenceId();
+    if (!licenceId) {
       Alert.alert('Erreur', 'Licence introuvable.');
       return;
     }
 
-    const credits = await fetchCreditsFromServer(resolvedId);
+    const credits = await fetchCreditsFromServer(licenceId);
     if (credits !== null && credits < batch.length) {
       Alert.alert('Crédits insuffisants', `Crédits: ${credits}, SMS requis: ${batch.length}.`);
       return;
@@ -689,7 +561,7 @@ const resetClientHistory = async (rawPhone: string) => {
         if (!message) { failed++; setProgressCount((x) => x + 1); continue; }
 
         try {
-          await sendOne({ licenceId: resolvedId, phoneNumber: phone, message });
+          await sendOne({ licenceId, phoneNumber: phone, message });
 
           const idx = updated.findIndex((u) => sanitizePhone(u.telephone) === phone);
           if (idx !== -1) {
@@ -829,22 +701,13 @@ const resetClientHistory = async (rawPhone: string) => {
         </View>
       )}
 
-      {/* Modale de choix du type de message */}
-      <Modal
-        visible={typeModalVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setTypeModalVisible(false)}
-      >
+      {/* Modale type */}
+      <Modal visible={typeModalVisible} transparent animationType="fade" onRequestClose={() => setTypeModalVisible(false)}>
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
             <Text style={styles.customTitle}>Type de message</Text>
             {(['Lunettes','SAV','Lentilles','Commande'] as const).map((t) => (
-              <TouchableOpacity
-                key={t}
-                style={styles.typeBtn}
-                onPress={() => sendBatch(t)}
-              >
+              <TouchableOpacity key={t} style={styles.typeBtn} onPress={() => sendBatch(t)}>
                 <Text style={styles.customBtnText}>{t}</Text>
               </TouchableOpacity>
             ))}
@@ -865,12 +728,7 @@ const resetClientHistory = async (rawPhone: string) => {
       </Modal>
 
       {/* Modale “Personnalisé” */}
-      <Modal
-        visible={customModalVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setCustomModalVisible(false)}
-      >
+      <Modal visible={customModalVisible} transparent animationType="fade" onRequestClose={() => setCustomModalVisible(false)}>
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
             <Text style={styles.customTitle}>Message personnalisé</Text>
@@ -974,6 +832,4 @@ const styles = StyleSheet.create({
   progressLine: { color: '#ddd', marginTop: 2 },
   progressOk: { color: '#3ddc84', marginTop: 6, fontWeight: '700' },
   progressErr: { color: '#ff6b6b', marginTop: 6, fontWeight: '700' },
-  modalActionBtn: { paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8 },
-  modalActionText: { color: '#fff', fontWeight: '700' },
 });
