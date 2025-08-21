@@ -1,6 +1,6 @@
-// SettingsPage.tsx — alias expéditeur, signature, prefs & templates (synchro serveur)
+// SettingsPage.tsx — prefs & templates (synchro serveur) — SANS expéditeur/signature
 
-import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   View, Modal, Pressable, Text, TextInput, StyleSheet,
   TouchableOpacity, Alert, ScrollView, Linking, Switch,
@@ -38,10 +38,6 @@ const LICENCE_PREFS_POST = `${SERVER_BASE}/api/licence/prefs`;
 const TEMPLATES_GET  = (licenceId: string) => `${SERVER_BASE}/api/templates?licenceId=${encodeURIComponent(licenceId)}`;
 const TEMPLATES_SAVE = `${SERVER_BASE}/api/templates/save`;
 
-const LICENCE_SET_SENDER    = `${SERVER_BASE}/licence/expediteur`; // sans /api
-const LICENCE_SET_SIGNATURE = `${SERVER_BASE}/licence/signature`;  // sans /api
-
-
 // --- Types ---
 type CustomMessage = { title: string; content: string };
 type TemplateItem  = { id: string; label: string; text: string };
@@ -51,13 +47,6 @@ function safeParseJSON<T = any>(raw: string | null): T | null {
   if (!raw) return null;
   try { return JSON.parse(raw) as T; } catch { return null; }
 }
-
-const normalizeSender = (raw?: string) => {
-  let s = String(raw ?? 'OptiCOM').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  if (s.length < 3) s = 'OPTICOM';
-  if (s.length > 11) s = s.slice(0, 11);
-  return s;
-};
 
 async function openURLSafe(url: string) {
   try {
@@ -97,8 +86,6 @@ export default function SettingsPage() {
   }, [navigation]);
 
   const [licence, setLicence] = useState<any>(null);
-  const [expediteurRaw, setExpediteurRaw] = useState('');
-  const [signature, setSignature] = useState('');
   const [messages, setMessages] = useState<Record<string, CustomMessage>>({});
   const [showLogoutModal, setShowLogoutModal] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
@@ -114,14 +101,11 @@ export default function SettingsPage() {
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
 
-  const expediteurNormalized = useMemo(() => normalizeSender(expediteurRaw), [expediteurRaw]);
-
   // IDs dérivés
   const cleLicence = String(licence?.licence || '').trim();
   const licenceId  = String(licence?.id || '').trim();
-  const opticienId = String(licence?.opticien?.id || '').trim() || undefined;
 
-  // -------- helpers ID & POST strict --------
+  // -------- helpers ID --------
   const ensureLicenceId = useCallback(async (): Promise<string> => {
     if (logoutRef.current) throw new Error('LOGGED_OUT');
     if (licence?.id) return String(licence.id);
@@ -140,28 +124,13 @@ export default function SettingsPage() {
   }, [licence]);
 
   const ensureLicenceKey = useCallback(async (): Promise<string> => {
-  if (licence?.licence) return String(licence.licence);
-  const loc = safeParseJSON<any>(await AsyncStorage.getItem('licence'));
-  if (loc?.licence) return String(loc.licence);
-  const raw = await AsyncStorage.getItem('licence.key');
-  if (raw) return String(raw);
-  throw new Error('NO_LICENCE_KEY');
-}, [licence]);
-
-
-  const postJson = async (url: string, body: any) => {
-    if (logoutRef.current) throw new Error('LOGGED_OUT');
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j?.success === false || j?.ok === false) {
-      throw new Error(j?.error || `HTTP ${r.status}`);
-    }
-    return j;
-  };
+    if (licence?.licence) return String(licence.licence);
+    const loc = safeParseJSON<any>(await AsyncStorage.getItem('licence'));
+    if (loc?.licence) return String(loc.licence);
+    const raw = await AsyncStorage.getItem('licence.key');
+    if (raw) return String(raw);
+    throw new Error('NO_LICENCE_KEY');
+  }, [licence]);
 
   // -------- Garde: si pas de licence => redirection immédiate vers LicenceCheck --------
   useFocusEffect(
@@ -181,28 +150,14 @@ export default function SettingsPage() {
   useEffect(() => {
     (async () => {
       try {
-        const [storedLicenceRaw, storedSignature, storedMessagesRaw] = await Promise.all([
+        const [storedLicenceRaw, storedMessagesRaw] = await Promise.all([
           AsyncStorage.getItem('licence'),
-          AsyncStorage.getItem('signature'),
           AsyncStorage.getItem('messages'),
         ]);
 
         const parsedLicence = safeParseJSON<any>(storedLicenceRaw);
         if (parsedLicence) {
           setLicence(parsedLicence);
-          const candidate =
-            parsedLicence.libelleExpediteur ||
-            parsedLicence.opticien?.enseigne ||
-            parsedLicence.nom || 'OptiCOM';
-          setExpediteurRaw(String(candidate));
-          if (typeof parsedLicence.signature === 'string' && parsedLicence.signature.length > 0) {
-            setSignature(parsedLicence.signature);
-          } else if (typeof storedSignature === 'string') {
-            setSignature(storedSignature);
-          }
-        } else {
-          setExpediteurRaw('OptiCOM');
-          if (typeof storedSignature === 'string') setSignature(storedSignature);
         }
 
         if (storedMessagesRaw) {
@@ -289,12 +244,6 @@ export default function SettingsPage() {
         if (newLicence) {
           setLicence(newLicence);
           await AsyncStorage.setItem('licence', JSON.stringify(newLicence));
-          const sender = newLicence.libelleExpediteur || newLicence.opticien?.enseigne || newLicence.nom || 'OptiCOM';
-          setExpediteurRaw(String(sender));
-          if (typeof newLicence.signature === 'string') {
-            setSignature(newLicence.signature);
-            await AsyncStorage.setItem('signature', newLicence.signature);
-          }
         }
       } catch (e) { if (!initial) console.warn('Licence GET failed:', (e as Error).message); }
 
@@ -338,117 +287,6 @@ export default function SettingsPage() {
     } catch (e: any) { if (!logoutRef.current) setSyncError(e?.message || 'Erreur inconnue'); }
     finally { if (!logoutRef.current) setSyncing(false); }
   }, [cleLicence, licenceId, messages, saveTemplatesToServer]);
-
-  // --- SAVE expéditeur/signature (POST, endpoints sans /api) ---
-  const saveSenderRemote = useCallback(async (normalized: string) => {
-  const [id, cle] = await Promise.all([
-    ensureLicenceId().catch(() => undefined),
-    ensureLicenceKey().catch(() => undefined),
-  ]);
-
-  const payload: any = { libelleExpediteur: normalized, opticienId };
-  if (id)  payload.licenceId = id;
-  if (cle) payload.cle       = cle;
-
-  try {
-    const r = await fetch(`${SERVER_BASE}/licence/expediteur`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j?.ok === false) throw new Error(j?.error || `HTTP ${r.status}`);
-    if (j?.licence) {
-      setLicence(j.licence);
-      await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
-    }
-    return true;
-  } catch (e) {
-    console.warn('saveSenderRemote error:', e);
-    return false;
-  }
-}, [ensureLicenceId, ensureLicenceKey, opticienId]);
-
-
-const saveSignatureRemote = useCallback(async (sig: string) => {
-  const [id, cle] = await Promise.all([
-    ensureLicenceId().catch(() => undefined),
-    ensureLicenceKey().catch(() => undefined),
-  ]);
-
-  const payload: any = { signature: String(sig ?? '').trim().slice(0, 200), opticienId };
-  if (id)  payload.licenceId = id;
-  if (cle) payload.cle       = cle;
-
-  try {
-    const r = await fetch(`${SERVER_BASE}/licence/signature`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j?.ok === false) throw new Error(j?.error || `HTTP ${r.status}`);
-    if (j?.licence) {
-      setLicence(j.licence);
-      await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
-    }
-    return true;
-  } catch (e) {
-    console.warn('saveSignatureRemote error:', e);
-    return false;
-  }
-}, [ensureLicenceId, ensureLicenceKey, opticienId]);
-
-
-
-  const handleSaveBasics = async () => {
-    try {
-      const normalized = normalizeSender(expediteurRaw);
-      if (normalized.length < 3) {
-        Alert.alert('Expéditeur', 'Doit contenir 3 à 11 caractères alphanumériques.');
-        return;
-      }
-
-      await AsyncStorage.setItem('signature', signature);
-      if (licence) {
-        const updated = { ...licence, libelleExpediteur: normalized, signature };
-        setLicence(updated);
-        await AsyncStorage.setItem('licence', JSON.stringify(updated));
-      }
-      setExpediteurRaw(normalized);
-
-      const [okSender, okSig] = await Promise.all([saveSenderRemote(normalized), saveSignatureRemote(signature)]);
-
-      if (okSender || okSig) {
-        try {
-          const id  = await ensureLicenceId().catch(() => undefined);
-          const cle = await ensureLicenceKey().catch(() => undefined);
-          const qs  = id ? `id=${encodeURIComponent(id)}` : `cle=${encodeURIComponent(String(cle||''))}`;
-          const ref = await fetch(`${SERVER_BASE}/api/licence?${qs}&_=${Date.now()}`, { headers: { Accept: 'application/json' } });
-
-          const txt = await ref.text();
-          if (ref.ok && txt) {
-            const data = JSON.parse(txt);
-            const fresh = data?.licence ?? data;
-            if (fresh) {
-              setLicence(fresh);
-              await AsyncStorage.setItem('licence', JSON.stringify(fresh));
-              setExpediteurRaw(String(fresh.libelleExpediteur || fresh.opticien?.enseigne || 'OptiCOM'));
-              if (typeof fresh.signature === 'string') {
-                setSignature(fresh.signature);
-                await AsyncStorage.setItem('signature', fresh.signature);
-              }
-            }
-          }
-        } catch {}
-        Alert.alert('Paramètres', 'Enregistrés avec succès.');
-      } else {
-        Alert.alert('Paramètres', 'Enregistré localement. (Serveur indisponible)');
-      }
-    } catch {
-      Alert.alert('Erreur', 'Impossible de sauvegarder les paramètres.');
-    }
-  };
 
   // --- Automatisations ---
   const handleSaveAutomations = async () => {
@@ -521,8 +359,6 @@ const saveSignatureRemote = useCallback(async (sig: string) => {
       // Purge état local + fermer la modale
       setShowLogoutModal(false);
       setLicence(null);
-      setExpediteurRaw('');
-      setSignature('');
       setMessages({});
 
       // attendre un tick pour laisser React appliquer l’état
@@ -582,32 +418,6 @@ const saveSignatureRemote = useCallback(async (sig: string) => {
               <Text style={[styles.label, { color: '#f6b' }]}>Nouvelle version disponible : {cgvInfo.currentVersion}</Text>
             ) : null}
           </>
-        )}
-      </View>
-
-      <View style={styles.block}>
-        <Text style={styles.label}>Libellé d’expéditeur pour les SMS :</Text>
-        <TextInput style={styles.input} value={expediteurRaw} onChangeText={setExpediteurRaw} placeholder="Nom qui apparaîtra dans les SMS" placeholderTextColor="#aaa" maxLength={11} />
-        <Text style={[styles.label, { marginTop: 6 }]}>
-          Aperçu normalisé : <Text style={{ color: '#fff' }}>{expediteurNormalized}</Text> ({expediteurNormalized.length}/11)
-        </Text>
-
-        <Text style={[styles.label, { marginTop: 14 }]}>Signature SMS (ajoutée à la fin de chaque message) :</Text>
-        <TextInput style={styles.input} value={signature} onChangeText={setSignature} placeholder="Ex: L’équipe Vision Plus" placeholderTextColor="#aaa" maxLength={120} />
-
-        <TouchableOpacity style={styles.button} onPress={handleSaveBasics}>
-          <Text style={styles.buttonText}>💾 Sauvegarder</Text>
-        </TouchableOpacity>
-
-        {!!licence?.libelleExpediteur && (
-          <Text style={[styles.label, { marginTop: 10 }]}>
-            Actuel : <Text style={{ color: '#fff', fontWeight: 'bold' }}>{licence.libelleExpediteur}</Text>
-          </Text>
-        )}
-        {!!licence?.signature && (
-          <Text style={[styles.label, { marginTop: 4 }]}>
-            Signature : <Text style={{ color: '#fff' }}>{licence.signature}</Text>
-          </Text>
         )}
       </View>
 

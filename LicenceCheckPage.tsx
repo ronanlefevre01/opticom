@@ -1,4 +1,4 @@
-// LicenceCheckPage.tsx (scroll garanti + cartes compactes)
+// LicenceCheckPage.tsx (scroll garanti + cartes compactes + expéditeur/signature)
 import React, { useEffect, useState, useMemo } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
@@ -18,13 +18,12 @@ const formulas = [
 
 const API_URL = 'https://opticom-sms-server.onrender.com';
 
-// Endpoints candidats (tolérance aux variations backend)
+// ---- Helpers API tolérants
 const licenceByKeyCandidates = (key: string) => [
   `${API_URL}/api/licence/by-key?key=${encodeURIComponent(key)}`,
   `${API_URL}/licence/by-key?key=${encodeURIComponent(key)}`,
   `${API_URL}/licence-by-key?cle=${encodeURIComponent(key)}`,
 ];
-
 async function fetchLicenceByKey(key: string) {
   for (const url of licenceByKeyCandidates(key)) {
     try {
@@ -38,14 +37,17 @@ async function fetchLicenceByKey(key: string) {
   }
   return null;
 }
-
 function extractKeyFromURL(url?: string | null) {
   if (!url) return null;
   const parsed = Linking.parse(url);
   const qp: any = parsed?.queryParams || {};
-  // on tolère plusieurs noms de query
   return (qp.licence || qp.key || qp.cle || '').toString().trim() || null;
 }
+
+// ---- Expéditeur/signature
+const PENDING_SMS_SETTINGS_KEY = 'pendingSenderSettings';
+const normalizeSenderUpper = (raw = '') =>
+  String(raw).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 11);
 
 export default function LicenceCheckPage() {
   const navigation = useNavigation<any>();
@@ -60,18 +62,43 @@ export default function LicenceCheckPage() {
   const [creditQuantity, setCreditQuantity] = useState(1);
   const [verifTerminee, setVerifTerminee] = useState(false);
 
-  // helper: persiste et route Home
+  // Nouveaux champs
+  const [libelleExpediteur, setLibelleExpediteur] = useState('');
+  const [signature, setSignature] = useState('');
+  const senderPreview = normalizeSenderUpper(libelleExpediteur);
+  const senderValid = senderPreview.length >= 3;
+
+  const handleChange = (k: keyof typeof form, v: string) => setForm({ ...form, [k]: v });
+
+  // helper: persiste & route Home
   const persistLicenceAndGoHome = useMemo(() => {
     return async (licence: any, fallbackKey?: string | null) => {
       try {
-        // Normalisation douce : s'assurer qu’on garde une trace de la clé
-        const key =
-          String(licence?.licence || licence?.cle || fallbackKey || '').trim() || null;
+        const key = String(licence?.licence || licence?.cle || fallbackKey || '').trim() || null;
+
+        // Si on a des réglages en attente → bootstrap côté serveur dès qu’on a l’ID
+        try {
+          const pendingRaw = await AsyncStorage.getItem(PENDING_SMS_SETTINGS_KEY);
+          if (pendingRaw && licence?.id) {
+            const pending = JSON.parse(pendingRaw);
+            if (pending?.libelleExpediteur || pending?.signature) {
+              await fetch(`${API_URL}/api/licence/bootstrap`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  licenceId: licence.id,
+                  libelleExpediteur: pending.libelleExpediteur || undefined,
+                  signature: pending.signature || undefined,
+                }),
+              }).catch(() => {});
+            }
+            await AsyncStorage.removeItem(PENDING_SMS_SETTINGS_KEY);
+          }
+        } catch {}
 
         await AsyncStorage.setItem('licence', JSON.stringify(licence ?? (key ? { licence: key, cle: key } : {})));
         if (key) await AsyncStorage.setItem('licenceKey', key);
 
-        // Sauvegarde des infos d’abonnement si présentes
         try {
           await saveSubscriptionData({
             creditsRestants: licence?.creditsRestants ?? null,
@@ -96,7 +123,6 @@ export default function LicenceCheckPage() {
         if (stored) {
           try {
             const obj = JSON.parse(stored);
-            // On considère valide s’il y a au moins une info clé/id
             if (obj?.cle || obj?.licence || obj?.id || obj?.opticien?.id) {
               navigation.reset({ index: 0, routes: [{ name: 'Home' }] });
               return;
@@ -104,7 +130,7 @@ export default function LicenceCheckPage() {
           } catch {}
         }
 
-        // 2) Deep link ? (ex: opticom://licence?key=XXXX)
+        // 2) Deep link ?
         const initialUrl = await Linking.getInitialURL();
         const urlKey = extractKeyFromURL(initialUrl);
         if (urlKey) {
@@ -113,12 +139,11 @@ export default function LicenceCheckPage() {
             await persistLicenceAndGoHome(lic, urlKey);
             return;
           }
-          // si serveur KO, on stocke au moins la clé
           await persistLicenceAndGoHome(null, urlKey);
           return;
         }
 
-        // 3) Ancienne clé simple déjà en local -> tenter de compléter l’objet
+        // 3) Ancienne clé simple locale
         const legacy = await AsyncStorage.getItem('licenceKey');
         if (legacy) {
           const lic = await fetchLicenceByKey(legacy);
@@ -126,7 +151,6 @@ export default function LicenceCheckPage() {
             await persistLicenceAndGoHome(lic, legacy);
             return;
           }
-          // sinon on garde la clé simple
           await persistLicenceAndGoHome(null, legacy);
           return;
         }
@@ -138,14 +162,18 @@ export default function LicenceCheckPage() {
     })();
   }, [persistLicenceAndGoHome, navigation]);
 
-  const handleChange = (k: keyof typeof form, v: string) => setForm({ ...form, [k]: v });
-
+  // Soumission
   const handleSubmit = async () => {
     const { nomMagasin, adresse, codePostal, ville, telephone, email, siret, pays } = form;
     if (!nomMagasin || !adresse || !codePostal || !ville || !telephone || !email || !siret) {
       Alert.alert('Erreur', 'Tous les champs sont obligatoires.');
       return;
     }
+    if (!senderValid) {
+      Alert.alert('Expéditeur invalide', 'Le libellé expéditeur doit contenir 3 à 11 caractères (A-Z / 0-9).');
+      return;
+    }
+
     if (selectedFormula === 'alacarte') {
       setShowCreditModal(true);
       return;
@@ -153,7 +181,13 @@ export default function LicenceCheckPage() {
 
     setLoading(true);
     try {
-      // Crée un mandat SEPA (abonnement)
+      // On garde les réglages en attente pour bootstrap après retour (deep link)
+      await AsyncStorage.setItem(
+        PENDING_SMS_SETTINGS_KEY,
+        JSON.stringify({ libelleExpediteur: senderPreview, signature: signature?.trim() || '' })
+      );
+
+      // Crée un mandat SEPA (abonnement) — on envoie aussi expéditeur/signature
       const r = await fetch(`${API_URL}/create-mandat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -161,16 +195,21 @@ export default function LicenceCheckPage() {
           nomMagasin, email, telephone, adresse, ville, codePostal, siret,
           pays: (pays || 'FR').toUpperCase(),
           formuleId: selectedFormula || 'starter',
+          // ↓ on les transmet au serveur (il peut les stocker et/ou les appliquer plus tard)
+          libelleExpediteur: senderPreview,
+          signature: signature?.trim() || ''
         }),
       });
       const j = await r.json().catch(() => ({} as any));
       if (r.ok && j?.url) {
         Linking.openURL(j.url);
       } else {
+        await AsyncStorage.removeItem(PENDING_SMS_SETTINGS_KEY);
         Alert.alert('Erreur', j?.error || 'Création du mandat impossible.');
       }
     } catch (e) {
       console.error(e);
+      await AsyncStorage.removeItem(PENDING_SMS_SETTINGS_KEY);
       Alert.alert('Erreur', 'Impossible de contacter le serveur.');
     } finally {
       setLoading(false);
@@ -181,11 +220,9 @@ export default function LicenceCheckPage() {
     setShowCreditModal(false);
     const qty = Math.max(1, parseInt(String(creditQuantity), 10) || 1);
     try {
-      // Achat one-shot de crédits (À la carte)
       const r = await fetch(`${API_URL}/create-checkout-session`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        // backend attend `clientEmail` et `quantity`
         body: JSON.stringify({ clientEmail: form.email, quantity: qty }),
       });
       const j = await r.json().catch(() => ({} as any));
@@ -223,69 +260,125 @@ export default function LicenceCheckPage() {
         >
           <Text style={styles.title}>🔐 Inscription à OptiCOM</Text>
 
-          {/* Formulaire */}
-          <TextInput
-            style={styles.input}
-            placeholder="Nom du magasin"
-            placeholderTextColor="#666"
-            value={form.nomMagasin}
-            onChangeText={(v) => handleChange('nomMagasin', v)}
-          />
-          <TextInput
-            style={styles.input}
-            placeholder="Adresse"
-            placeholderTextColor="#666"
-            value={form.adresse}
-            onChangeText={(v) => handleChange('adresse', v)}
-          />
-          <TextInput
-            style={styles.input}
-            placeholder="Code postal"
-            placeholderTextColor="#666"
-            keyboardType="number-pad"
-            value={form.codePostal}
-            onChangeText={(v) => handleChange('codePostal', v)}
-          />
-          <TextInput
-            style={styles.input}
-            placeholder="Ville"
-            placeholderTextColor="#666"
-            value={form.ville}
-            onChangeText={(v) => handleChange('ville', v)}
-          />
-          <TextInput
-            style={styles.input}
-            placeholder="Téléphone"
-            placeholderTextColor="#666"
-            keyboardType="phone-pad"
-            value={form.telephone}
-            onChangeText={(v) => handleChange('telephone', v)}
-          />
-          <TextInput
-            style={styles.input}
-            placeholder="Email"
-            placeholderTextColor="#666"
-            keyboardType="email-address"
-            autoCapitalize="none"
-            value={form.email}
-            onChangeText={(v) => handleChange('email', v)}
-          />
-          <TextInput
-            style={styles.input}
-            placeholder="SIRET"
-            placeholderTextColor="#666"
-            keyboardType="number-pad"
-            value={form.siret}
-            onChangeText={(v) => handleChange('siret', v)}
-          />
-          <TextInput
-            style={styles.input}
-            placeholder="Pays (ex: FR)"
-            placeholderTextColor="#666"
-            autoCapitalize="characters"
-            value={form.pays}
-            onChangeText={(v) => handleChange('pays', v)}
-          />
+          {/* Identité magasin */}
+          <View style={styles.row}>
+            <View style={styles.col}>
+              <TextInput
+                style={styles.input}
+                placeholder="Nom du magasin"
+                placeholderTextColor="#666"
+                value={form.nomMagasin}
+                onChangeText={(v) => handleChange('nomMagasin', v)}
+              />
+            </View>
+            <View style={styles.col}>
+              <TextInput
+                style={styles.input}
+                placeholder="Adresse"
+                placeholderTextColor="#666"
+                value={form.adresse}
+                onChangeText={(v) => handleChange('adresse', v)}
+              />
+            </View>
+          </View>
+
+          <View style={styles.row}>
+            <View style={styles.col}>
+              <TextInput
+                style={styles.input}
+                placeholder="Code postal"
+                placeholderTextColor="#666"
+                keyboardType="number-pad"
+                value={form.codePostal}
+                onChangeText={(v) => handleChange('codePostal', v)}
+              />
+            </View>
+            <View style={styles.col}>
+              <TextInput
+                style={styles.input}
+                placeholder="Ville"
+                placeholderTextColor="#666"
+                value={form.ville}
+                onChangeText={(v) => handleChange('ville', v)}
+              />
+            </View>
+          </View>
+
+          <View style={styles.row}>
+            <View style={styles.col}>
+              <TextInput
+                style={styles.input}
+                placeholder="Téléphone"
+                placeholderTextColor="#666"
+                keyboardType="phone-pad"
+                value={form.telephone}
+                onChangeText={(v) => handleChange('telephone', v)}
+              />
+            </View>
+            <View style={styles.col}>
+              <TextInput
+                style={styles.input}
+                placeholder="Email"
+                placeholderTextColor="#666"
+                keyboardType="email-address"
+                autoCapitalize="none"
+                value={form.email}
+                onChangeText={(v) => handleChange('email', v)}
+              />
+            </View>
+          </View>
+
+          <View style={styles.row}>
+            <View style={styles.col}>
+              <TextInput
+                style={styles.input}
+                placeholder="SIRET"
+                placeholderTextColor="#666"
+                keyboardType="number-pad"
+                value={form.siret}
+                onChangeText={(v) => handleChange('siret', v)}
+              />
+            </View>
+            <View style={styles.col}>
+              <TextInput
+                style={styles.input}
+                placeholder="Pays (ex: FR)"
+                placeholderTextColor="#666"
+                autoCapitalize="characters"
+                value={form.pays}
+                onChangeText={(v) => handleChange('pays', v)}
+              />
+            </View>
+          </View>
+
+          {/* Identité d'envoi SMS */}
+          <Text style={styles.subtitle}>Identité d’envoi SMS</Text>
+          <View style={styles.row}>
+            <View style={styles.col}>
+              <TextInput
+                style={styles.input}
+                placeholder="Libellé expéditeur (A-Z/0-9, 3–11)"
+                placeholderTextColor="#666"
+                autoCapitalize="characters"
+                value={libelleExpediteur}
+                onChangeText={(v) => setLibelleExpediteur(v)}
+                onBlur={() => setLibelleExpediteur(senderPreview)}
+              />
+              <Text style={styles.hint}>
+                Aperçu: <Text style={senderValid ? styles.hintOk : styles.hintErr}>{senderPreview || '—'}</Text>
+              </Text>
+            </View>
+            <View style={styles.col}>
+              <TextInput
+                style={[styles.input, { minHeight: 48 }]}
+                placeholder="Signature (ajoutée à la fin du SMS)"
+                placeholderTextColor="#666"
+                value={signature}
+                onChangeText={setSignature}
+                multiline
+              />
+            </View>
+          </View>
 
           {/* Formules (compactes) */}
           <Text style={styles.subtitle}>Formule</Text>
@@ -356,23 +449,54 @@ const CARD_MAX = Platform.OS === 'web' ? 220 : 220; // compact partout
 
 const styles = StyleSheet.create({
   title: { fontSize: 22, fontWeight: 'bold', color: '#fff', marginBottom: 10 },
-  input: {
-    backgroundColor: '#1a1a1a', color: '#fff', padding: 12, marginBottom: 12,
-    borderRadius: 8, borderWidth: 1, borderColor: '#333',
+
+  row: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 12,
   },
-  subtitle: { fontSize: 16, fontWeight: 'bold', color: '#fff', marginTop: 20, marginBottom: 10 },
+  col: {
+    flex: 1,
+    minWidth: 0,
+  },
+
+  input: {
+    backgroundColor: '#1a1a1a',
+    color: '#fff',
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#333',
+  },
+
+  hint: { color: '#9aa', fontSize: 12, marginTop: 6 },
+  hintOk: { color: '#8ef' },
+  hintErr: { color: '#ff6b6b' },
+
+  subtitle: { fontSize: 16, fontWeight: 'bold', color: '#fff', marginTop: 16, marginBottom: 10 },
+
   formulaRow: {
-    flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-start',
-    columnGap: 12, rowGap: 12, marginBottom: 20,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'flex-start',
+    columnGap: 12,
+    rowGap: 12,
+    marginBottom: 8,
   },
   formulaCard: {
-    backgroundColor: '#222', borderRadius: 16, padding: 14,
-    width: '100%', maxWidth: CARD_MAX, borderWidth: 1, borderColor: '#444',
+    backgroundColor: '#222',
+    borderRadius: 16,
+    padding: 14,
+    width: '100%',
+    maxWidth: CARD_MAX,
+    borderWidth: 1,
+    borderColor: '#444',
   },
   formulaCardSelected: { backgroundColor: '#00BFFF', borderColor: '#00BFFF' },
   formulaTitle: { fontSize: 16, fontWeight: '700', color: '#fff', marginBottom: 6 },
   formulaDetail: { color: '#fff', fontSize: 13 },
   formulaPrice: { color: '#fff', fontSize: 14, fontWeight: 'bold', marginTop: 6 },
+
   button: { backgroundColor: '#00BFFF', padding: 14, borderRadius: 10, alignItems: 'center', marginTop: 20 },
   buttonText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
 });
