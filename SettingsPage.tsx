@@ -139,6 +139,16 @@ export default function SettingsPage() {
     return id;
   }, [licence]);
 
+  const ensureLicenceKey = useCallback(async (): Promise<string> => {
+  if (licence?.licence) return String(licence.licence);
+  const loc = safeParseJSON<any>(await AsyncStorage.getItem('licence'));
+  if (loc?.licence) return String(loc.licence);
+  const raw = await AsyncStorage.getItem('licence.key');
+  if (raw) return String(raw);
+  throw new Error('NO_LICENCE_KEY');
+}, [licence]);
+
+
   const postJson = async (url: string, body: any) => {
     if (logoutRef.current) throw new Error('LOGGED_OUT');
     const r = await fetch(url, {
@@ -331,36 +341,64 @@ export default function SettingsPage() {
 
   // --- SAVE expéditeur/signature (POST, endpoints sans /api) ---
   const saveSenderRemote = useCallback(async (normalized: string) => {
-  const id = licenceId || await ensureLicenceId();
-  const payload = { licenceId: id, opticienId, libelleExpediteur: normalized };
-  const r = await fetch(LICENCE_SET_SENDER, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const j = await r.json().catch(() => ({}));
-  if (j?.licence) {
-    setLicence(j.licence);
-    await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+  const [id, cle] = await Promise.all([
+    ensureLicenceId().catch(() => undefined),
+    ensureLicenceKey().catch(() => undefined),
+  ]);
+
+  const payload: any = { libelleExpediteur: normalized, opticienId };
+  if (id)  payload.licenceId = id;
+  if (cle) payload.cle       = cle;
+
+  try {
+    const r = await fetch(`${SERVER_BASE}/licence/expediteur`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j?.ok === false) throw new Error(j?.error || `HTTP ${r.status}`);
+    if (j?.licence) {
+      setLicence(j.licence);
+      await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+    }
+    return true;
+  } catch (e) {
+    console.warn('saveSenderRemote error:', e);
+    return false;
   }
-  return r.ok && j?.licence;
-}, [licenceId, ensureLicenceId, opticienId]);
+}, [ensureLicenceId, ensureLicenceKey, opticienId]);
+
 
 const saveSignatureRemote = useCallback(async (sig: string) => {
-  const id = licenceId || await ensureLicenceId();
-  const payload = { licenceId: id, opticienId, signature: String(sig ?? '').trim().slice(0, 200) };
-  const r = await fetch(LICENCE_SET_SIGNATURE, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const j = await r.json().catch(() => ({}));
-  if (j?.licence) {
-    setLicence(j.licence);
-    await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+  const [id, cle] = await Promise.all([
+    ensureLicenceId().catch(() => undefined),
+    ensureLicenceKey().catch(() => undefined),
+  ]);
+
+  const payload: any = { signature: String(sig ?? '').trim().slice(0, 200), opticienId };
+  if (id)  payload.licenceId = id;
+  if (cle) payload.cle       = cle;
+
+  try {
+    const r = await fetch(`${SERVER_BASE}/licence/signature`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j?.ok === false) throw new Error(j?.error || `HTTP ${r.status}`);
+    if (j?.licence) {
+      setLicence(j.licence);
+      await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+    }
+    return true;
+  } catch (e) {
+    console.warn('saveSignatureRemote error:', e);
+    return false;
   }
-  return r.ok && j?.licence;
-}, [licenceId, ensureLicenceId, opticienId]);
+}, [ensureLicenceId, ensureLicenceKey, opticienId]);
+
 
 
   const handleSaveBasics = async () => {
@@ -383,8 +421,11 @@ const saveSignatureRemote = useCallback(async (sig: string) => {
 
       if (okSender || okSig) {
         try {
-          const id = await ensureLicenceId();
-          const ref = await fetch(`${SERVER_BASE}/api/licence?id=${encodeURIComponent(id)}&_=${Date.now()}`, { headers: { Accept: 'application/json' } });
+          const id  = await ensureLicenceId().catch(() => undefined);
+          const cle = await ensureLicenceKey().catch(() => undefined);
+          const qs  = id ? `id=${encodeURIComponent(id)}` : `cle=${encodeURIComponent(String(cle||''))}`;
+          const ref = await fetch(`${SERVER_BASE}/api/licence?${qs}&_=${Date.now()}`, { headers: { Accept: 'application/json' } });
+
           const txt = await ref.text();
           if (ref.ok && txt) {
             const data = JSON.parse(txt);
