@@ -8,7 +8,11 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
-    "platforms": ["ios", "android", "web"],
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
@@ -41,13 +45,23 @@
       "backgroundColor": "#000000",
       "meta": {
         "viewport": "width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover",
-        "apple": { "webAppCapable": true, "statusBarStyle": "default" }
+        "apple": {
+          "webAppCapable": true,
+          "statusBarStyle": "default"
+        }
       }
     },
-    "assetBundlePatterns": ["**/*"],
+    "assetBundlePatterns": [
+      "**/*"
+    ],
     "extra": {
-      "eas": { "projectId": "19127098-ffe2-4065-818b-673b40026c5b" }
+      "eas": {
+        "projectId": "19127098-ffe2-4065-818b-673b40026c5b"
+      }
     },
-    "owner": "ronanlefevre01"
+    "owner": "ronanlefevre01",
+    "plugins": [
+      "expo-secure-store"
+    ]
   }
 }

@@ -15,8 +15,15 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native';
+import * as SecureStore from 'expo-secure-store';
 import { Licence } from './types';
 import API_BASE from './src/config/api';
+
+/* ───────── helpers SecureStore ───────── */
+async function saveLicenceKeySecure(key: string) {
+  try { await SecureStore.setItemAsync('licenceKey', key); } catch {}
+  try { await AsyncStorage.setItem('licenceKey', key); } catch {}
+}
 
 /* ───────── CGV Modal ───────── */
 function CGVModalRN({
@@ -74,7 +81,7 @@ function CGVModalRN({
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
-        Alert.alert('Erreur', j.error || "Enregistrement impossible.");
+        Alert.alert('Erreur', j.error || 'Enregistrement impossible.');
         setLoading(false);
         return;
       }
@@ -140,6 +147,121 @@ function CGVModalRN({
   );
 }
 
+/* ───────── Modal création de compte (après CGV) ───────── */
+function CreateAccountModal({
+  visible,
+  defaultEmail,
+  licenceIdOrKey,
+  onDone,
+  onSkip,
+}: {
+  visible: boolean;
+  defaultEmail?: string | null;
+  licenceIdOrKey: string;
+  onDone: () => void;
+  onSkip: () => void;
+}) {
+  const [email, setEmail] = useState(defaultEmail || '');
+  const [pwd, setPwd] = useState('');
+  const [pwd2, setPwd2] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (visible) {
+      setEmail(defaultEmail || '');
+      setPwd('');
+      setPwd2('');
+      setErr(null);
+      setLoading(false);
+    }
+  }, [visible, defaultEmail]);
+
+  const submit = async () => {
+    setErr(null);
+    const e = email.trim();
+    if (!e || !/.+@.+\..+/.test(e)) { setErr('Adresse e-mail invalide.'); return; }
+    if (!pwd || pwd.length < 8) { setErr('Mot de passe trop court (min. 8 caractères).'); return; }
+    if (pwd !== pwd2) { setErr('Les mots de passe ne correspondent pas.'); return; }
+
+    setLoading(true);
+    try {
+      const body: any = { email: e, password: pwd };
+      // on envoie licenceId ou licenceKey selon ce qu’on a
+      if (/^[0-9a-f-]{16,}$/i.test(licenceIdOrKey)) body.licenceId = licenceIdOrKey;
+      else body.licenceKey = licenceIdOrKey;
+
+      const r = await fetch(`${API_BASE}/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json().catch(() => ({}));
+
+      if (!r.ok || j?.ok === false) {
+        const msg = j?.error || (r.status === 409 ? 'Cet e-mail est déjà utilisé.' : 'Création de compte impossible.');
+        setErr(msg);
+        setLoading(false);
+        return;
+      }
+
+      try { await AsyncStorage.setItem('authEmail', e); } catch {}
+      Alert.alert('Compte créé', 'Votre compte a été créé. Vous pourrez vous connecter depuis l’écran d’accueil.');
+      onDone();
+    } catch (e: any) {
+      setErr(e?.message || 'Erreur réseau.');
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onSkip}>
+      <View style={styles.modalBackdrop}>
+        <View style={styles.modalCard}>
+          <Text style={styles.modalTitle}>Créer votre compte</Text>
+          <Text style={styles.modalSubtitle}>Cela vous permettra de vous reconnecter facilement (e-mail + mot de passe).</Text>
+
+          <TextInput
+            style={styles.input}
+            placeholder="Adresse e-mail"
+            placeholderTextColor="#666"
+            autoCapitalize="none"
+            keyboardType="email-address"
+            value={email}
+            onChangeText={setEmail}
+          />
+          <TextInput
+            style={[styles.input, { marginTop: 10 }]}
+            placeholder="Mot de passe (min. 8 caractères)"
+            placeholderTextColor="#666"
+            secureTextEntry
+            value={pwd}
+            onChangeText={setPwd}
+          />
+          <TextInput
+            style={[styles.input, { marginTop: 10 }]}
+            placeholder="Confirmer le mot de passe"
+            placeholderTextColor="#666"
+            secureTextEntry
+            value={pwd2}
+            onChangeText={setPwd2}
+          />
+          {err ? <Text style={{ color: '#d00', marginTop: 8 }}>{err}</Text> : null}
+
+          <View style={styles.modalActions}>
+            <TouchableOpacity style={styles.secondaryBtn} onPress={onSkip} disabled={loading}>
+              <Text style={styles.secondaryBtnText}>Plus tard</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.primaryBtn} onPress={submit} disabled={loading}>
+              <Text style={styles.primaryBtnText}>{loading ? 'Création…' : 'Créer le compte'}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 /* ───────── Page Licence ───────── */
 export default function LicencePage() {
   const [cle, setCle] = useState('');
@@ -150,6 +272,9 @@ export default function LicencePage() {
     textUrl: '',
     serverTextHash: null,
   });
+
+  // création de compte
+  const [showCreateAccount, setShowCreateAccount] = useState(false);
 
   const navigation = useNavigation<any>();
 
@@ -176,17 +301,16 @@ export default function LicencePage() {
       return;
     }
 
-    // On enlève seulement les espaces (on garde tirets & casse)
     const key = keyInput.replace(/\s+/g, '');
 
-    // Stub local pour passer le gate si reboot hors-ligne
+    // Stub local (hors-ligne)
     await AsyncStorage.setItem('licenceKey', key);
+    await saveLicenceKeySecure(key);
     await AsyncStorage.setItem('licence', JSON.stringify({ cle: key }));
 
     let trouvee: Licence | undefined;
     let lastErrText = '';
 
-    // ✅ Priorité à /api/licence/by-key (c’est celle qui fonctionne chez toi)
     const paths = [
       `/api/licence/by-key?cle=${encodeURIComponent(key)}`,
       `/licence/by-key?cle=${encodeURIComponent(key)}`,
@@ -227,18 +351,16 @@ export default function LicencePage() {
       return;
     }
 
-    // 🔄 Sauvegarde locale + cache hors-ligne
     const resolvedKeyRaw = String(
       (trouvee as any).licence ?? (trouvee as any).cle ?? (trouvee as any).key ?? key
     );
     await AsyncStorage.setItem('licence', JSON.stringify(trouvee));
     await AsyncStorage.setItem('licenceKey', resolvedKeyRaw);
+    await saveLicenceKeySecure(resolvedKeyRaw);
     await AsyncStorage.setItem('localLicence', JSON.stringify(trouvee));
     setLicence(trouvee);
 
-    // 👉 Pour le check CGV, on envoie la clé telle qu’elle est (sinon l’id)
-    const licenceIdForCgv =
-      resolvedKeyRaw || String((trouvee as any).id || '');
+    const licenceIdForCgv = resolvedKeyRaw || String((trouvee as any).id || '');
 
     try {
       const r = await fetch(
@@ -259,13 +381,13 @@ export default function LicencePage() {
         setShowCGV(true);
       } else {
         await AsyncStorage.setItem('cgvAcceptedVersion', j.acceptedVersion || j.currentVersion);
-        Alert.alert('Licence activée', `Bienvenue ${trouvee.opticien?.enseigne || ''}`);
-        navigation.reset({ index: 0, routes: [{ name: 'Home' }] });
+        // 👉 si CGV déjà ok, on tente de savoir si un compte existe
+        await maybeShowCreateAccount(trouvee, resolvedKeyRaw);
       }
     } catch {
       const acceptedVersion = await AsyncStorage.getItem('cgvAcceptedVersion');
       if (acceptedVersion) {
-        Alert.alert('Mode hors-ligne', 'Accès accordé (CGV déjà acceptées).');
+        // pas de réseau, on passe quand même
         navigation.reset({ index: 0, routes: [{ name: 'Home' }] });
       } else {
         Alert.alert('Erreur', 'Impossible de vérifier les CGV.');
@@ -273,13 +395,35 @@ export default function LicencePage() {
     }
   };
 
+  const maybeShowCreateAccount = async (lic: Licence | null, licenceKeyOrId: string) => {
+    // Essaie de détecter si un compte existe déjà. Si l’endpoint n’existe pas → on affiche la création.
+    try {
+      const res = await fetch(
+        `${API_BASE}/auth/has-account?licenceId=${encodeURIComponent(
+          (lic as any)?.id || licenceKeyOrId
+        )}`
+      );
+      if (res.ok) {
+        const j = await res.json().catch(() => ({}));
+        if (j?.accountExists) {
+          Alert.alert('Licence activée', `Bienvenue ${lic?.opticien?.enseigne || ''}`);
+          navigation.reset({ index: 0, routes: [{ name: 'Home' }] });
+          return;
+        }
+      }
+    } catch {}
+    // soit endpoint KO, soit pas de compte → on propose de créer
+    setShowCreateAccount(true);
+  };
+
   const onCgvAccepted = async () => {
     setShowCGV(false);
-    if (cgvMeta.version) {
-      await AsyncStorage.setItem('cgvAcceptedVersion', cgvMeta.version);
-    }
-    Alert.alert('Licence activée', `Bienvenue ${licence?.opticien?.enseigne || ''}`);
-    navigation.reset({ index: 0, routes: [{ name: 'Home' }] });
+    if (cgvMeta.version) await AsyncStorage.setItem('cgvAcceptedVersion', cgvMeta.version);
+
+    const keyOrId =
+      String((licence as any)?.licence || (licence as any)?.cle || (licence as any)?.key || (licence as any)?.id || '');
+    // Après CGV → étape création compte (si pas déjà existant)
+    await maybeShowCreateAccount(licence, keyOrId);
   };
 
   return (
@@ -317,6 +461,27 @@ export default function LicencePage() {
         textUrl={cgvMeta.textUrl}
         serverTextHash={cgvMeta.serverTextHash}
         onAccepted={onCgvAccepted}
+      />
+
+      <CreateAccountModal
+        visible={showCreateAccount}
+        defaultEmail={(licence as any)?.opticien?.email || ''}
+        licenceIdOrKey={String(
+          (licence as any)?.id ||
+          (licence as any)?.licence ||
+          (licence as any)?.cle ||
+          (licence as any)?.key ||
+          ''
+        )}
+        onDone={() => {
+          setShowCreateAccount(false);
+          Alert.alert('Licence activée', `Bienvenue ${licence?.opticien?.enseigne || ''}`);
+          navigation.reset({ index: 0, routes: [{ name: 'Home' }] });
+        }}
+        onSkip={() => {
+          setShowCreateAccount(false);
+          navigation.reset({ index: 0, routes: [{ name: 'Home' }] });
+        }}
       />
     </View>
   );
