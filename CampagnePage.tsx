@@ -85,53 +85,74 @@ const ensureStopClause = (m: string) =>
   /stop\s+au\s+36111/i.test(m) ? m : `${m} STOP au 36111`;
 
 /* ===================== Crédit (server pre-check) ===================== */
+/* ===================== Crédit (server pre-check) ===================== */
 const fetchCreditsFromServer = async (licenceId: string): Promise<number | null> => {
   const urls = [
-    `${API_BASE}/licence/credits?licenceId=${encodeURIComponent(licenceId)}`,
-    `${API_BASE}/licence-credits?licenceId=${encodeURIComponent(licenceId)}`,
-    `${API_BASE}/credits?licenceId=${encodeURIComponent(licenceId)}`,
+    `${API_BASE}/api/licence?id=${encodeURIComponent(licenceId)}`,
+    `${API_BASE}/licence?id=${encodeURIComponent(licenceId)}`, // fallback
   ];
-  let lastErr: any = null;
   for (const url of urls) {
     try {
       const res = await fetch(url);
-      const text = await res.text();
-      if (!res.ok) { lastErr = new Error(`HTTP ${res.status}: ${text}`); continue; }
-      let data: any = {};
-      try { data = JSON.parse(text); } catch { continue; }
-      const credits =
-        data?.credits ?? data?.remaining ?? data?.solde ?? (typeof data === 'number' ? data : null);
-      if (typeof credits === 'number') return credits;
-    } catch (e) { lastErr = e; }
+      const txt = await res.text();
+      if (!res.ok) continue;
+      const data = JSON.parse(txt);
+      const lic = data?.licence ?? data;
+      if (lic && typeof lic.credits === 'number') return lic.credits;
+      if (lic?.abonnement === 'Illimitée') return Number.MAX_SAFE_INTEGER; // on traite comme "illimité"
+    } catch {}
   }
-  console.warn('Credits endpoint unavailable:', lastErr?.message || lastErr);
+  console.warn('Credits endpoint unavailable');
   return null;
 };
 
+
 /* ===================== HTTP send ===================== */
 const sendSMS = async ({
-  phoneNumber, message, emetteur, licenceId, cle,
+  phoneNumber,
+  message,
+  emetteur,
+  licenceId,
+  cle,
+  isPromo,
+  category,             // ← pour l’historique serveur
+  marketingConsent,     // ← pour satisfaire la vérif côté /send-promotional
 }: {
-  phoneNumber: string; message: string; emetteur?: string;
-  licenceId: string | null; cle: string | null;
+  phoneNumber: string;
+  message: string;
+  emetteur?: string;
+  licenceId: string | null;
+  cle: string | null;
+  isPromo: boolean;
+  category?: string;
+  marketingConsent?: boolean;
 }) => {
-  const payload: any = { phoneNumber, message };
+  const endpoint = isPromo ? `${API_BASE}/send-promotional` : `${API_BASE}/send-sms`;
+
+  const payload: any = {
+    phoneNumber,
+    message,
+    categorie: category,         // (le serveur accepte categorie|category|type)
+    category,
+  };
   if (emetteur) payload.emetteur = emetteur;
   if (licenceId) payload.licenceId = licenceId;
   if (cle) payload.cle = cle;
+  if (isPromo) payload.marketingConsent = marketingConsent === true;
 
-  const resp = await fetch(SEND_SMS_ENDPOINT, {
+  const resp = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
   const data = await resp.json().catch(() => ({} as any));
-  if (!resp.ok || (data?.success === false)) {
-    const err = data?.error || (resp.status === 403 ? 'Licence/crédits/consentement.' : "Échec envoi.");
+  if (!resp.ok || data?.success === false) {
+    const err = data?.error || (resp.status === 403 ? 'Licence/crédits/consentement.' : 'Échec envoi.');
     throw new Error(err);
   }
   return true;
 };
+
 
 /* ===================== Modèles ===================== */
 const campagnes = [
@@ -275,94 +296,106 @@ export default function CampagnePage() {
   });
 
   const confirmerEnvoi = async () => {
-    if (!selectedCampagneId) return;
+  if (!selectedCampagneId) return;
 
-    const campagne = [...campagnes, ...relanceLentilles, ...campagnesSaisonnieres]
-      .find((c) => c.id === selectedCampagneId);
+  const campagne = [...campagnes, ...relanceLentilles, ...campagnesSaisonnieres]
+    .find((c) => c.id === selectedCampagneId);
 
-    const messageTemplate = getMessageById(selectedCampagneId);
-    const clientsCibles = filteredClients.filter((c) => selectedClients[getClientKey(c)]);
+  const messageTemplate = getMessageById(selectedCampagneId);
+  const clientsCibles = filteredClients.filter((c) => selectedClients[getClientKey(c)]);
 
-    const { licenceId, cle } = await getLicenceFromStorage();
-    if (!licenceId && !cle) {
-      Alert.alert('Erreur', 'Licence introuvable.');
+  const { licenceId, cle } = await getLicenceFromStorage();
+  if (!licenceId && !cle) {
+    Alert.alert('Erreur', 'Licence introuvable.');
+    return;
+  }
+
+  // Pré-check crédits (optionnel)
+  if (licenceId) {
+    const creditsActuels = await fetchCreditsFromServer(licenceId);
+    if (creditsActuels !== null && creditsActuels < clientsCibles.length) {
+      Alert.alert('Crédits insuffisants',
+        `Il vous reste ${creditsActuels} crédits, mais ${clientsCibles.length} sont nécessaires.`);
       return;
     }
+  }
 
-    // Pré-check (optionnel)
-    if (licenceId) {
-      const creditsActuels = await fetchCreditsFromServer(licenceId);
-      if (creditsActuels !== null && creditsActuels < clientsCibles.length) {
-        Alert.alert('Crédits insuffisants',
-          `Il vous reste ${creditsActuels} crédits, mais ${clientsCibles.length} sont nécessaires.`);
-        return;
-      }
-    }
+  const emetteur  = await getSenderLabelFromSettings();
+  const signature = await getSignatureFromSettings();
+  const isPromo   = (campagne as any)?.type === 'promotionnelle';
 
-    const emetteur  = await getSenderLabelFromSettings();
-    const signature = await getSignatureFromSettings();
-    const isPromo   = (campagne as any)?.type === 'promotionnelle';
+  // Reset UI progression
+  setProgressCount(0);
+  setProgressTotal(clientsCibles.length);
+  setBatchSummary(null);
+  setSendError(null);
+  setSendStep('prep');
+  setSending(true);
 
-    // Modale progression (reset)
-    setProgressCount(0);
-    setProgressTotal(clientsCibles.length);
-    setBatchSummary(null);
-    setSendError(null);
-    setSendStep('prep');
-    setSending(true);
+  let sent = 0, skipped = 0, failed = 0;
 
-    let sent = 0, skipped = 0, failed = 0;
+  try {
+    setSendStep('send');
 
-    try {
-      setSendStep('send');
+    for (const client of clientsCibles) {
+      const phone = sanitizePhone(client.telephone || '');
+      if (!isPhone10(phone)) { skipped++; setProgressCount((p)=>p+1); continue; }
 
-      for (const client of clientsCibles) {
-        const phone = sanitizePhone(client.telephone || '');
-        if (!isPhone10(phone)) { skipped++; setProgressCount((p)=>p+1); continue; }
+      // Consentements
+      const hasMarketing = !!(client as any)?.consentementMarketing
+                        || !!(client as any)?.consent?.marketing_sms?.value;
+      const hasService   = !!(client as any)?.consent?.service_sms?.value;
 
-        // Consentement : promo -> marketing, sinon -> service
-        const hasMarketing = !!(client as any)?.consentementMarketing || !!(client as any)?.consent?.marketing_sms?.value;
-        const hasService   = !!(client as any)?.consent?.service_sms?.value;
-
-        if ((isPromo && !hasMarketing) || (!isPromo && !hasService)) {
-          skipped++; setProgressCount((p)=>p+1); continue;
-        }
-
-        let messageFinal = (messageTemplate || '')
-          .replace('{prenom}', client.prenom || '')
-          .replace('{nom}', client.nom || '')
-          .replace(/\s*\{prenom\}\s*/g, '')
-          .replace(/\s*\{nom\}\s*/g, '')
-          .replace(/\s+/g, ' ')
-          .trim();
-
-        messageFinal = appendSignature(messageFinal, signature);
-        if (isPromo) messageFinal = ensureStopClause(messageFinal);
-        if (!messageFinal) { failed++; setProgressCount((p)=>p+1); continue; }
-
-        try {
-          await sendSMS({ phoneNumber: phone, message: messageFinal, emetteur, licenceId, cle });
-          sent++;
-        } catch (e) {
-          console.warn(`Échec SMS à ${phone}:`, (e as Error).message);
-          failed++;
-        } finally {
-          setProgressCount((p)=>p+1);
-          await new Promise(r => setTimeout(r, 120)); // petite pause anti-burst
-        }
+      if ((isPromo && !hasMarketing) || (!isPromo && !hasService)) {
+        skipped++; setProgressCount((p)=>p+1); continue;
       }
 
-      if (sent > 0) { try { await consumeCredits(sent); } catch {} }
+      // Message final
+      let messageFinal = (messageTemplate || '')
+        .replace('{prenom}', client.prenom || '')
+        .replace('{nom}', client.nom || '')
+        .replace(/\s*\{prenom\}\s*/g, '')
+        .replace(/\s*\{nom\}\s*/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
 
-      setBatchSummary({ sent, skipped, failed });
-      setSendStep('done');
-      setTimeout(()=> setSending(false), 1000);
-      setModalVisible(false);
-    } catch (e:any) {
-      setSendError(e?.message || 'Erreur inconnue');
-      setSendStep('error');
-    }
-  };
+      messageFinal = appendSignature(messageFinal, signature);
+      if (isPromo) messageFinal = ensureStopClause(messageFinal);
+      if (!messageFinal) { failed++; setProgressCount((p)=>p+1); continue; }
+
+      try {
+        await sendSMS({
+          phoneNumber: phone,
+          message: messageFinal,
+          emetteur,
+          licenceId,
+          cle,
+          isPromo,                                                // choisit le bon endpoint
+          category: selectedCampagneId || (campagne?.id ?? 'autre'),
+          marketingConsent: hasMarketing,
+        });
+        sent++;
+      } catch (e) {
+        console.warn(`Échec SMS à ${phone}:`, (e as Error).message);
+        failed++;
+      } finally {
+        setProgressCount((p) => p + 1);
+        await new Promise((r) => setTimeout(r, 120));            // petite pause anti-burst
+      }
+    } // ← fin du for
+
+    if (sent > 0) { try { await consumeCredits(sent); } catch {} }
+
+    setBatchSummary({ sent, skipped, failed });
+    setSendStep('done');
+    setTimeout(() => setSending(false), 1000);
+    setModalVisible(false);
+  } catch (e:any) {
+    setSendError(e?.message || 'Erreur inconnue');
+    setSendStep('error');
+  }
+};
+
 
   const getClientKey = (c: Client) => String((c as any).id || c.telephone || '').trim();
 
