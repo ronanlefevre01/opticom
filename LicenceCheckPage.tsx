@@ -136,10 +136,28 @@ export default function LicenceCheckPage() {
     };
   }, [navigation]);
 
-  // Au montage : auto-bootstrap licence ou licenceKey
+  // Au montage : 0) auto-login par token, puis 1/2/3 clés/deeplink/legacy
   useEffect(() => {
     (async () => {
       try {
+        // 0) token JWT => /api/auth/me
+        try {
+          const token = await SecureStore.getItemAsync('authToken');
+          if (token) {
+            const r = await fetch(`${API_URL}/api/auth/me`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            const j = await r.json().catch(() => ({} as any));
+            if (r.ok && j?.ok && j.licence) {
+              await AsyncStorage.setItem('licence', JSON.stringify(j.licence));
+              const k = String(j.licence.licence || j.licence.cle || '');
+              if (k) await saveLicenceKey(k);
+              navigation.reset({ index: 0, routes: [{ name: 'Home' }] });
+              return;
+            }
+          }
+        } catch {}
+
         // 1) licence déjà stockée (objet)
         const stored = await AsyncStorage.getItem('licence');
         if (stored) {
@@ -185,14 +203,17 @@ export default function LicenceCheckPage() {
     setLoginLoading(true);
     setLoginError(null);
     try {
-      const r = await fetch(`${API_URL}/auth/login`, {
+      const r = await fetch(`${API_URL}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: loginEmail.trim(), password: loginPassword }),
       });
       const j = await r.json().catch(() => ({}));
-      if (!r.ok || j?.ok === false) {
-        throw new Error(j?.error || 'IDENTIFIANTS_INVALIDES');
+      if (!r.ok || j?.ok === false) throw new Error(j?.error || 'IDENTIFIANTS_INVALIDES');
+
+      // 🔐 token pour auto-login futur
+      if (j?.token) {
+        try { await SecureStore.setItemAsync('authToken', j.token); } catch {}
       }
 
       // L’API peut renvoyer la licence directement, ou bien une clé
@@ -212,7 +233,7 @@ export default function LicenceCheckPage() {
       try { await AsyncStorage.setItem('authEmail', loginEmail.trim()); } catch {}
       setShowLoginModal(false);
       setLoginPassword('');
-    } catch (e:any) {
+    } catch (e: any) {
       setLoginError(e?.message || 'Connexion impossible.');
     } finally {
       setLoginLoading(false);
@@ -368,7 +389,7 @@ export default function LicenceCheckPage() {
           {/* Identité d'envoi SMS */}
           <Text style={styles.subtitle}>Identité d’envoi SMS</Text>
           <View style={styles.row}>
-            <View className="col" style={styles.col}>
+            <View style={styles.col}>
               <TextInput
                 style={styles.input}
                 placeholder="Libellé expéditeur (A-Z/0-9, 3–11)"
