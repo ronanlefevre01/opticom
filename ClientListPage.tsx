@@ -6,12 +6,13 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native';
-import { Client, SMSCategory } from './types';
-import { NavigationProps } from './navigationTypes';
+
+import type { Client, SMSCategory } from './types';
+import type { NavigationProps } from './navigationTypes';
 import API_BASE from './src/config/api';
 
-// ✅ utilise le service avec cache + dédoublonnage
-import { getClients as getClientsFromService } from './src/sync/clientSync';
+// service clients (cache + dedoublonnage)
+import { fetchClientsOnce, type ClientRow } from './src/services/clients';
 
 const SEND_SMS_ENDPOINT = `${API_BASE}/send-sms`;
 
@@ -61,14 +62,16 @@ const getSignatureFromSettings = async (): Promise<string> => {
     return '';
   }
 };
+
+// version 100% ASCII (evite les soucis d'encodage)
 const appendSignature = (msg: string, sig: string) => {
   const m = (msg || '').trim();
   const s = (sig || '').trim();
   if (!s) return m;
   const norm = (x: string) => x.replace(/\s+/g, ' ').trim().toLowerCase();
-  if (norm(m).endsWith(norm(s)) || norm(m).includes(norm(' — ' + s))) return m;
+  if (norm(m).endsWith(norm(s)) || norm(m).endsWith((' - ' + s).toLowerCase())) return m;
   const needsSpace = /[.!?]$/.test(m);
-  const sep = needsSpace ? ' ' : ' — ';
+  const sep = needsSpace ? ' ' : ' - ';
   return `${m}${sep}${s}`;
 };
 
@@ -110,7 +113,7 @@ const getStableLicenceId = async (): Promise<string | null> => {
   return null;
 };
 
-/** ---- Historique SMS depuis la licence (JSONBin) ---- */
+/** ---- Historique SMS depuis la licence ---- */
 type ServerSmsItem = { date: string; type: string; numero: string };
 const labelFromType = (t: string) => {
   if (t === 'marketing') return 'Marketing';
@@ -144,30 +147,24 @@ const fetchSmsHistoryFromLicence = async (licenceId: string, cle?: string | null
 };
 
 /* ---- mapping service row -> Client local ---- */
-type ClientRow = {
-  id: string;
-  prenom?: string;
-  nom?: string;
-  phone?: string;
-  telephone?: string;
-  email?: string;
-  updatedAt?: string;
-  deletedAt?: string | null;
+const rowToClient = (s: ClientRow): Client => {
+  const tel = sanitizePhone(s.telephone || s.phone || '');
+  return {
+    id: String(s.id || tel || ''),
+    prenom: s.prenom || '',
+    nom: s.nom || '',
+    telephone: tel,
+    email: s.email || '',
+    dateNaissance: '',
+    lunettes: false,
+    lentilles: [],
+    consentementMarketing: false,
+    consent: { service_sms: { value: true }, marketing_sms: { value: false } },
+    messagesEnvoyes: [],
+    createdAt: s.updatedAt || new Date().toISOString(),
+    updatedAt: s.updatedAt || new Date().toISOString(),
+  };
 };
-const rowToClient = (s: ClientRow): Client => ({
-  id: s.id,
-  prenom: s.prenom || '',
-  nom: s.nom || '',
-  telephone: sanitizePhone(s.telephone || s.phone || ''),
-  email: s.email || '',
-  dateNaissance: '', // non exposé par le service
-  lunettes: false,
-  lentilles: [],
-  consentementMarketing: false,
-  consent: { service_sms: { value: true }, marketing_sms: { value: false } },
-  messagesEnvoyes: [],
-  createdAt: s.updatedAt || new Date().toISOString(),
-});
 
 /* ---- tombstones & resets locaux ---- */
 const KEY_CLIENT_TOMBSTONES = 'clients.tombstones';           // téléphones sanitisés
@@ -202,7 +199,7 @@ async function saveHistoryResets(map: ResetMap) {
 /* ---- templates / filtres ---- */
 const FILTER_TYPES: (SMSCategory | 'Tous')[] = ['Tous', 'Lunettes', 'Lentilles', 'SAV', 'Commande'];
 const DEFAULT_TEMPLATES: Record<SMSCategory, string> = {
-  Lunettes:  'Bonjour {prenom} {nom}, vos lunettes sont prêtes. À bientôt !',
+  Lunettes:  'Bonjour {prenom} {nom}, vos lunettes sont prêtes. A bientôt !',
   SAV:       'Bonjour {prenom} {nom}, votre SAV est terminé, vous pouvez venir le récupérer.',
   Lentilles: 'Bonjour {prenom} {nom}, vos lentilles sont disponibles en magasin.',
   Commande:  'Bonjour {prenom} {nom}, votre commande est arrivée !',
@@ -258,7 +255,7 @@ export default function ClientListPage() {
       const tombstoneSet = new Set(tombstones);
 
       // 1) Clients via service (cache TTL 15 s + dédoublonnage)
-      const rows = await getClientsFromService(licenceId, force);
+      const rows = await fetchClientsOnce(licenceId, { force });
       const remote = (rows || [])
         .filter(r => !r.deletedAt) // sécurité
         .map(rowToClient)
@@ -283,13 +280,19 @@ export default function ClientListPage() {
         return { ...c, messagesEnvoyes: logs };
       });
 
-      // 4) Merger avec local (préserve histor. local si besoin)
+      // 4) Merger avec local (et migration phone -> telephone)
       const localStr = await AsyncStorage.getItem('clients');
-      const local: Client[] = localStr ? JSON.parse(localStr) : [];
+      const localRaw: any[] = localStr ? JSON.parse(localStr) : [];
+      const local: Client[] = (Array.isArray(localRaw) ? localRaw : []).map((l: any) => {
+        const tel = sanitizePhone(l.telephone || l.phone || '');
+        return { ...l, telephone: tel };
+      });
+
       const mergedByPhone = new Map<string, Client>();
       for (const s of withHistory) mergedByPhone.set(sanitizePhone(s.telephone), s);
       for (const l of local) {
         const key = sanitizePhone(l.telephone);
+        if (!key) continue;
         if (!mergedByPhone.has(key)) mergedByPhone.set(key, l);
         else {
           // fusion messagesEnvoyes
@@ -322,9 +325,20 @@ export default function ClientListPage() {
       const clientData = await AsyncStorage.getItem('clients');
       const messageData = await AsyncStorage.getItem('messages');
       if (clientData) {
-        const parsed: Client[] = JSON.parse(clientData);
-        setClients(parsed);
-        setFilteredClients(parsed);
+        try {
+          const parsed: any[] = JSON.parse(clientData);
+          // migration locale (phone -> telephone) + sanitization
+          const normalized: Client[] = (Array.isArray(parsed) ? parsed : []).map((c: any) => {
+            const tel = sanitizePhone(c.telephone || c.phone || '');
+            return { ...c, telephone: tel };
+          });
+          setClients(normalized);
+          setFilteredClients(normalized);
+          await AsyncStorage.setItem('clients', JSON.stringify(normalized));
+        } catch {
+          setClients([]);
+          setFilteredClients([]);
+        }
       }
       if (messageData) {
         try { setCustomMessages(JSON.parse(messageData)); } catch {}
@@ -352,6 +366,7 @@ export default function ClientListPage() {
 
   const toggleSelect = (rawPhone: string) => {
     const phone = sanitizePhone(rawPhone);
+    if (!phone) return;
     setSelectedClients((prev) =>
       prev.includes(phone) ? prev.filter((p) => p !== phone) : [...prev, phone]
     );
@@ -359,7 +374,7 @@ export default function ClientListPage() {
 
   // suppression (DELETE côté serveur) + tombstone local si échec
   const deleteClient = async (rawPhone: string) => {
-    const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est définitive.');
+    const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est definitive.');
     if (!ok) return;
 
     const phone = sanitizePhone(rawPhone);
@@ -401,9 +416,9 @@ export default function ClientListPage() {
   // reset historique — purge serveur si possible + marqueur local anti-retour
   const resetClientHistory = async (rawPhone: string) => {
     const ok = await confirmAsync(
-      'Réinitialiser l’historique ?',
+      'Reinitialiser l’historique ?',
       'Effacer l’historique des SMS de ce client ?',
-      'Réinitialiser'
+      'Reinitialiser'
     );
     if (!ok) return;
 
@@ -468,7 +483,7 @@ export default function ClientListPage() {
 
   const openSmsDialog = () => {
     if (selectedClients.length === 0) {
-      Alert.alert('Info', 'Sélectionne au moins un client.');
+      Alert.alert('Info', 'Selectionne au moins un client.');
       return;
     }
     setTypeModalVisible(true);
@@ -485,7 +500,7 @@ export default function ClientListPage() {
     });
     const data = await resp.json().catch(() => ({} as any));
     if (!resp.ok || (data?.success === false)) {
-      const err = data?.error || (resp.status === 403 ? 'Consentement/crédits/licence.' : "Échec de l’envoi.");
+      const err = data?.error || (resp.status === 403 ? 'Consentement/credits/licence.' : "Echec de l’envoi.");
       throw new Error(err);
     }
     return true;
@@ -513,7 +528,7 @@ export default function ClientListPage() {
   const sendBatch = async (category: SMSCategory | '__custom__') => {
     const batch = clients.filter((c) => selectedClients.includes(sanitizePhone(c.telephone)));
     if (batch.length === 0) {
-      Alert.alert('Info', 'Sélectionne au moins un client.');
+      Alert.alert('Info', 'Selectionne au moins un client.');
       return;
     }
 
@@ -525,7 +540,7 @@ export default function ClientListPage() {
 
     const credits = await fetchCreditsFromServer(licenceId);
     if (credits !== null && credits < batch.length) {
-      Alert.alert('Crédits insuffisants', `Crédits: ${credits}, SMS requis: ${batch.length}.`);
+      Alert.alert('Credits insuffisants', `Credits: ${credits}, SMS requis: ${batch.length}.`);
       return;
     }
 
@@ -576,7 +591,7 @@ export default function ClientListPage() {
 
           sent++;
         } catch (e) {
-          console.warn(`Échec SMS ${c.telephone}:`, (e as Error).message);
+          console.warn(`Echec SMS ${c.telephone}:`, (e as Error).message);
           failed++;
         } finally {
           setProgressCount((x) => x + 1);
@@ -603,7 +618,7 @@ export default function ClientListPage() {
         <TouchableOpacity onPress={() => toggleSelect(item.telephone)} style={{ flex: 1 }}>
           <Text style={styles.clientText}>
             {selectedClients.includes(sanitizePhone(item.telephone)) ? '☑ ' : '☐ '}
-            {item.prenom} {item.nom} ({item.telephone})
+            {item.prenom} {item.nom} {item.telephone ? `(${item.telephone})` : ''}
           </Text>
         </TouchableOpacity>
 
@@ -620,7 +635,7 @@ export default function ClientListPage() {
           style={[styles.editButton, { marginLeft: 6 }]}
           hitSlop={{top:8,bottom:8,left:8,right:8}}
         >
-          <Text style={styles.editButtonText}>Réinitialiser</Text>
+          <Text style={styles.editButtonText}>Reinitialiser</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
@@ -638,7 +653,7 @@ export default function ClientListPage() {
             .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
             .map((msg, idx) => {
               const date = new Date(msg.date);
-              const formatted = `${date.toLocaleDateString()} à ${date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
+              const formatted = `${date.toLocaleDateString()} a ${date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
               return (
                 <Text key={idx} style={styles.smsHistoryText}>
                   - {msg.type} le {formatted}
@@ -653,7 +668,7 @@ export default function ClientListPage() {
   return (
     <View style={styles.container}>
       <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-        <Text style={styles.title}>Clients enregistrés</Text>
+        <Text style={styles.title}>Clients enregistres</Text>
         <TouchableOpacity onPress={() => syncFromServer(true)} style={styles.syncBtn} disabled={syncing}>
           <Text style={styles.syncBtnText}>{syncing ? '…' : '↻ Sync'}</Text>
         </TouchableOpacity>
@@ -689,7 +704,7 @@ export default function ClientListPage() {
 
       <FlatList
         data={filteredClients}
-        keyExtractor={(item) => sanitizePhone(item.telephone)}
+        keyExtractor={(item, i) => sanitizePhone(item.telephone) || String(item.id || i)}
         renderItem={renderItem}
       />
 
@@ -715,7 +730,7 @@ export default function ClientListPage() {
               style={[styles.typeBtn, { backgroundColor: '#555' }]}
               onPress={() => { setTypeModalVisible(false); setCustomModalVisible(true); }}
             >
-              <Text style={styles.customBtnText}>Personnalisé</Text>
+              <Text style={styles.customBtnText}>Personnalise</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.typeBtn, { backgroundColor: '#3b0d0d' }]}
@@ -727,11 +742,11 @@ export default function ClientListPage() {
         </View>
       </Modal>
 
-      {/* Modale “Personnalisé” */}
+      {/* Modale “Personnalise” */}
       <Modal visible={customModalVisible} transparent animationType="fade" onRequestClose={() => setCustomModalVisible(false)}>
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
-            <Text style={styles.customTitle}>Message personnalisé</Text>
+            <Text style={styles.customTitle}>Message personnalise</Text>
             <Text style={styles.customHint}>Placeholders : {'{prenom}'} et {'{nom}'}</Text>
             <TextInput
               style={styles.customInput}
@@ -766,15 +781,15 @@ export default function ClientListPage() {
             <Text style={styles.progressTitle}>Envoi des SMS…</Text>
             {sendStep !== 'done' && sendStep !== 'error' && <ActivityIndicator size="large" color="#fff" />}
             <View style={{ marginTop: 12, alignItems: 'center' }}>
-              <Text style={styles.progressLine}>{sendStep === 'prep' ? '• Préparation…' : '✓ Préparation'}</Text>
+              <Text style={styles.progressLine}>{sendStep === 'prep' ? '• Preparation…' : '✓ Preparation'}</Text>
               <Text style={styles.progressLine}>{sendStep === 'send' ? '• Envoi au serveur…' : (sendStep === 'prep' ? '• Envoi au serveur' : '✓ Envoi au serveur')}</Text>
               <Text style={[styles.progressLine, { marginTop: 8 }]}>{progressCount} / {progressTotal}</Text>
               {sendStep === 'done' && batchSummary && (
                 <View style={{ marginTop: 8 }}>
-                  <Text style={styles.progressOk}>✓ Terminé</Text>
-                  <Text style={styles.progressLine}>Envoyés : {batchSummary.sent}</Text>
-                  <Text style={styles.progressLine}>Ignorés (consentement/tél) : {batchSummary.skipped}</Text>
-                  <Text style={styles.progressLine}>Échecs : {batchSummary.failed}</Text>
+                  <Text style={styles.progressOk}>✓ Termine</Text>
+                  <Text style={styles.progressLine}>Envoyes : {batchSummary.sent}</Text>
+                  <Text style={styles.progressLine}>Ignores (consentement/tel) : {batchSummary.skipped}</Text>
+                  <Text style={styles.progressLine}>Echecs : {batchSummary.failed}</Text>
                 </View>
               )}
               {sendStep === 'error' && <Text style={styles.progressErr}>✗ {sendError || 'Erreur inconnue'}</Text>}
