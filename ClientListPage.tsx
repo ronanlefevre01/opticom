@@ -114,7 +114,13 @@ const getStableLicenceId = async (): Promise<string | null> => {
 };
 
 /** ---- Historique SMS depuis la licence ---- */
-type ServerSmsItem = { date: string; type: string; numero: string };
+type ServerSmsItem = {
+  date: string;
+  type: string;
+  numero: string;
+  // quelques alias possibles renvoyés par le serveur
+  campaignName?: string; campaign?: string; title?: string; nom?: string; name?: string;
+};
 const labelFromType = (t: string) => {
   if (t === 'marketing') return 'Marketing';
   if (t === 'transactional') return 'Transactionnel';
@@ -122,7 +128,10 @@ const labelFromType = (t: string) => {
   if (t === 'auto-renew') return 'Renouvellement auto';
   return 'SMS';
 };
-const fetchSmsHistoryFromLicence = async (licenceId: string, cle?: string | null): Promise<ServerSmsItem[]> => {
+const fetchSmsHistoryFromLicence = async (
+  licenceId: string,
+  cle?: string | null
+): Promise<ServerSmsItem[]> => {
   const urls: string[] = [
     `${API_BASE}/api/licence?id=${encodeURIComponent(licenceId)}`
   ];
@@ -132,19 +141,37 @@ const fetchSmsHistoryFromLicence = async (licenceId: string, cle?: string | null
       `${API_BASE}/licence?cle=${encodeURIComponent(cle)}`
     );
   }
+
   for (const url of urls) {
     try {
       const r = await fetch(url);
-      const txt = await r.text();
       if (!r.ok) continue;
-      const data = JSON.parse(txt);
+
+      const data = await r.json();
       const lic = data?.licence ?? data;
-      const items: ServerSmsItem[] = Array.isArray(lic?.historiqueSms) ? lic.historiqueSms : [];
-      return items;
+      const items: any[] = Array.isArray(lic?.historiqueSms) ? lic.historiqueSms : [];
+
+      // ✅ Normalisation : ajoute label = nom de campagne si présent, sinon libellé du type
+      const normalized: ServerSmsItem[] = items.map((h: any) => {
+        const base = labelFromType(h?.type); // ex: "Marketing", "Transactionnel", "Anniv auto", etc.
+        const rawName =
+          h?.campaignName || h?.campaign || h?.title || h?.nom || h?.name || h?.template || '';
+        const label = rawName ? String(rawName) : base;
+
+        return {
+          date: String(h?.date || ''),
+          type: String(h?.type || ''),
+          numero: String(h?.numero || ''),
+          label,
+        };
+      });
+
+      return normalized;
     } catch {}
   }
   return [];
 };
+
 
 /* ---- mapping service row -> Client local ---- */
 const rowToClient = (s: ClientRow): Client => {
@@ -263,22 +290,30 @@ export default function ClientListPage() {
 
       // 2) Historique de la licence (une seule requête)
       const hist = await fetchSmsHistoryFromLicence(licenceId, cle);
-      const byPhone = new Map<string, { date: string; type: string }[]>();
-      for (const h of hist) {
-        const key = sanitizePhone(h.numero || '');
-        if (!key) continue;
-        // ignore ce qui est antérieur au reset local éventuel
-        const resetAt = resets[key];
-        if (resetAt && new Date(h.date) <= new Date(resetAt)) continue;
-        if (!byPhone.has(key)) byPhone.set(key, []);
-        byPhone.get(key)!.push({ date: h.date, type: labelFromType(h.type) });
-      }
+const byPhone = new Map<string, { date: string; label: string }[]>();
+
+for (const h of hist) {
+  const key = sanitizePhone(h.numero || '');
+  if (!key) continue;
+  const resetAt = resets[key];
+  if (resetAt && new Date(h.date) <= new Date(resetAt)) continue;
+
+  if (!byPhone.has(key)) byPhone.set(key, []);
+  const label = h.label || labelFromType(h.type);
+  byPhone.get(key)!.push({ date: h.date, label });
+}
+
 
       // 3) Injecter l’historique
       const withHistory = remote.map(c => {
-        const logs = byPhone.get(sanitizePhone(c.telephone)) || [];
-        return { ...c, messagesEnvoyes: logs };
-      });
+  const logs = (byPhone.get(sanitizePhone(c.telephone)) || []).map(l => ({
+    date: l.date,
+    type: l.label,          // ce que tu afficheras (nom de campagne OU libellé du type)
+    campaign: l.label,      // si tu veux aussi garder explicitement le nom
+  }));
+  return { ...c, messagesEnvoyes: logs };
+});
+
 
       // 4) Merger avec local (et migration phone -> telephone)
       const localStr = await AsyncStorage.getItem('clients');
@@ -668,7 +703,7 @@ export default function ClientListPage() {
   return (
     <View style={styles.container}>
       <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-        <Text style={styles.title}>Clients enregistres</Text>
+        <Text style={styles.title}>Mes Clients</Text>
         <TouchableOpacity onPress={() => syncFromServer(true)} style={styles.syncBtn} disabled={syncing}>
           <Text style={styles.syncBtnText}>{syncing ? '…' : '↻ Sync'}</Text>
         </TouchableOpacity>
