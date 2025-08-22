@@ -524,22 +524,40 @@ for (const h of hist) {
     setTypeModalVisible(true);
   };
 
-  const sendOne = async ({ licenceId, phoneNumber, message }:{
-    licenceId: string; phoneNumber: string; message: string;
-  }) => {
-    const payload: any = { phoneNumber, message, licenceId };
-    const resp = await fetch(SEND_SMS_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await resp.json().catch(() => ({} as any));
-    if (!resp.ok || (data?.success === false)) {
-      const err = data?.error || (resp.status === 403 ? 'Consentement/credits/licence.' : "Echec de l’envoi.");
-      throw new Error(err);
-    }
-    return true;
+  const sendOne = async ({
+  licenceId,
+  phoneNumber,
+  message,
+  category,                     // ← nouveau
+}:{
+  licenceId: string;
+  phoneNumber: string;          // attendu 06… côté appelant
+  message: string;
+  category?: string;            // Lunettes | Lentilles | SAV | Commande | 'Marketing' | etc.
+}) => {
+  const e164 = toE164FR(phoneNumber);       // ✅ normalisation systématique
+  const payload: any = {
+    licenceId,
+    phoneNumber: e164,                       // ← on envoie E.164 au serveur
+    message,
+    category,                                // ← pour la journalisation/classement
   };
+
+  const resp = await fetch(SEND_SMS_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await resp.json().catch(() => ({} as any));
+
+  if (!resp.ok || data?.success === false || data?.ok === false) {
+    const errMsg = data?.error || data?.message || `HTTP ${resp.status}`;
+    throw new Error(errMsg);
+  }
+  return true;
+};
+
 
   const fetchCreditsFromServer = async (licenceId: string): Promise<number | null> => {
     const urls = [
@@ -611,7 +629,13 @@ for (const h of hist) {
         if (!message) { failed++; setProgressCount((x) => x + 1); continue; }
 
         try {
-          await sendOne({ licenceId, phoneNumber: phone, message });
+          await sendOne({
+  licenceId,
+  phoneNumber: phone,
+  message,
+  category: category === '__custom__' ? 'Personnalisé' : (category as string),
+});
+
 
           const idx = updated.findIndex((u) => sanitizePhone(u.telephone) === phone);
           if (idx !== -1) {
