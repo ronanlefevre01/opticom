@@ -44,9 +44,7 @@ export async function fetchClientsOnce(
 
   // Requête unique partagée
   const p = (async () => {
-    const url = `${SERVER_BASE}/api/clients?licenceId=${encodeURIComponent(
-      key
-    )}`; // ❌ sans &_=
+    const url = `${SERVER_BASE}/api/clients?licenceId=${encodeURIComponent(key)}`;
     const r = await fetch(url, {
       headers: { Accept: 'application/json' },
       cache: 'no-store',
@@ -66,7 +64,19 @@ export async function fetchClientsOnce(
   return p;
 }
 
+/** Alias rétro-compat: certaines pages appellent getClients(...) */
+export function getClients(
+  licenceId: string,
+  opts: { force?: boolean } = {}
+) {
+  return fetchClientsOnce(licenceId, opts);
+}
+
 /** Permet d'invalider manuellement le cache (ex. après un upsert). */
 export function invalidateClientsCache(licenceId: string) {
   cache.delete(String(licenceId));
 }
+
+/** Export par défaut sous forme d'objet pour supporter y.getClients(...) */
+const service = { fetchClientsOnce, getClients, invalidateClientsCache };
+export default service;
