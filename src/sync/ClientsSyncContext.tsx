@@ -1,17 +1,9 @@
 // src/sync/ClientsSyncContext.tsx
-import React, {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useRef,
-  useState,
-} from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { syncClientsNow } from './clientSync';
 import type { Client } from '../../types';
-
 
 type Ctx = {
   syncing: boolean;
@@ -31,67 +23,56 @@ export const ClientsSyncProvider: React.FC<React.PropsWithChildren> = ({ childre
   const [clients, setClients] = useState<Client[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null); // ← type timer RN safe
+
+  const runningRef = useRef(false);
+  const lastRunRef = useRef(0);
+  const MIN_GAP_MS = 15_000;
 
   const loadLocal = useCallback(async () => {
     try {
       const raw = await AsyncStorage.getItem('clients');
-      const arr = raw ? JSON.parse(raw) : [];
-      setClients(Array.isArray(arr) ? arr : []);
+      setClients(raw ? JSON.parse(raw) : []);
     } catch {
       setClients([]);
     }
   }, []);
 
   const runSync = useCallback(async () => {
-    if (syncing) return;
+    const now = Date.now();
+    if (runningRef.current) return;
+    if (now - lastRunRef.current < MIN_GAP_MS) return;
+
+    runningRef.current = true;
     setSyncing(true);
     setError(null);
-    try {
-      const res = await syncClientsNow(); // push + pull
-      if (!res.ok) setError(res.error || 'SYNC_ERROR');
-    } catch (e: any) {
-      setError(e?.message || 'SYNC_ERROR');
-    } finally {
-      await loadLocal(); // maj locale quoi qu’il arrive
-      setSyncing(false);
-    }
-  }, [syncing, loadLocal]);
 
-  // 1) au démarrage
-  useEffect(() => {
-    loadLocal();
-    // pas d’attente bloquante
-    runSync();
-  }, [loadLocal, runSync]);
+    const res = await syncClientsNow();
+    if (!res.ok) setError(res.error || 'SYNC_ERROR');
 
-  // 2) quand l’app revient au premier plan
+    await loadLocal();
+
+    setSyncing(false);
+    runningRef.current = false;
+    lastRunRef.current = Date.now();
+  }, [loadLocal]);
+
+  // au démarrage
+  useEffect(() => { loadLocal(); runSync(); }, [loadLocal, runSync]);
+
+  // retour au 1er plan
   useEffect(() => {
-    const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') runSync();
-    });
+    const sub = AppState.addEventListener('change', (s) => { if (s === 'active') runSync(); });
     return () => sub.remove();
   }, [runSync]);
 
-  // 3) toutes les X minutes (10 min)
+  // sync périodique
   useEffect(() => {
-    if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = setInterval(runSync, 10 * 60 * 1000);
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-      timerRef.current = null;
-    };
+    const t = setInterval(runSync, 10 * 60 * 1000); // toutes les 10 min
+    return () => clearInterval(t);
   }, [runSync]);
 
-  const value: Ctx = {
-    syncing,
-    error,
-    clients,
-    forceSync: runSync,
-  };
-
   return (
-    <ClientsSyncContext.Provider value={value}>
+    <ClientsSyncContext.Provider value={{ syncing, error, clients, forceSync: runSync }}>
       {children}
     </ClientsSyncContext.Provider>
   );
