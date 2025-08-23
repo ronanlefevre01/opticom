@@ -106,17 +106,17 @@ const fetchCreditsFromServer = async (licenceId: string): Promise<number | null>
   return null;
 };
 
+const toE164FR = (raw: string): string | null => {
+  const d = sanitizePhone(raw);         // "06XXXXXXXX" → "06XXXXXXXX"
+  if (!/^\d{10}$/.test(d)) return null;
+  return '+33' + d.slice(1);            // 06… → +336…
+};
+
+
 
 /* ===================== HTTP send ===================== */
 const sendSMS = async ({
-  phoneNumber,
-  message,
-  emetteur,
-  licenceId,
-  cle,
-  isPromo,
-  category,             // ← pour l’historique serveur
-  marketingConsent,     // ← pour satisfaire la vérif côté /send-promotional
+  phoneNumber, message, emetteur, licenceId, cle, isPromo, category, marketingConsent,
 }: {
   phoneNumber: string;
   message: string;
@@ -132,26 +132,39 @@ const sendSMS = async ({
   const payload: any = {
     phoneNumber,
     message,
-    categorie: category,         // (le serveur accepte categorie|category|type)
+    categorie: category,
     category,
+    ...(emetteur ? { emetteur } : {}),
+    ...(licenceId ? { licenceId } : {}),
+    ...(cle ? { cle } : {}),
+    ...(isPromo ? { marketingConsent: marketingConsent === true } : {}),
   };
-  if (emetteur) payload.emetteur = emetteur;
-  if (licenceId) payload.licenceId = licenceId;
-  if (cle) payload.cle = cle;
-  if (isPromo) payload.marketingConsent = marketingConsent === true;
 
-  const resp = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const data = await resp.json().catch(() => ({} as any));
+  // log utile pendant le debug
+  console.log('[SEND]', { endpoint, payload });
+
+  let resp: Response;
+  try {
+    resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (e:any) {
+    // ex: CORS sur Web, DNS, offline…
+    throw new Error(`NETWORK_ERROR: ${e?.message || e}`);
+  }
+
+  const text = await resp.text();
+  let data: any = {};
+  try { data = JSON.parse(text); } catch {}
+
   if (!resp.ok || data?.success === false) {
-    const err = data?.error || (resp.status === 403 ? 'Licence/crédits/consentement.' : 'Échec envoi.');
-    throw new Error(err);
+    throw new Error(data?.error || `HTTP_${resp.status}: ${text}`);
   }
   return true;
 };
+
 
 
 /* ===================== Modèles ===================== */
@@ -363,25 +376,39 @@ export default function CampagnePage() {
       if (isPromo) messageFinal = ensureStopClause(messageFinal);
       if (!messageFinal) { failed++; setProgressCount((p)=>p+1); continue; }
 
+      const e164 = toE164FR(phone);
+      if (!e164) { skipped++; setProgressCount((p)=>p+1); continue; }
+
+
       try {
-        await sendSMS({
-          phoneNumber: phone,
-          message: messageFinal,
-          emetteur,
-          licenceId,
-          cle,
-          isPromo,                                                // choisit le bon endpoint
-          category: selectedCampagneId || (campagne?.id ?? 'autre'),
-          marketingConsent: hasMarketing,
-        });
-        sent++;
-      } catch (e) {
-        console.warn(`Échec SMS à ${phone}:`, (e as Error).message);
-        failed++;
-      } finally {
-        setProgressCount((p) => p + 1);
-        await new Promise((r) => setTimeout(r, 120));            // petite pause anti-burst
-      }
+  await sendSMS({
+    phoneNumber: e164,
+    message: messageFinal,
+    emetteur,
+    licenceId,
+    cle,
+    isPromo,
+    category: selectedCampagneId || (campagne?.id ?? 'autre'),
+    marketingConsent: hasMarketing,
+  });
+  sent++;
+} catch (e: any) {
+  const msg = String(e?.message ?? '');
+  if (msg.includes('ENVOI_INTERDIT_HORAIRES')) {
+    Alert.alert(
+      'Envoi bloqué',
+      'Les envois promotionnels sont autorisés de 08:00 à 20:00 (heure FR).'
+    );
+  } else if (msg.startsWith('NETWORK_ERROR')) {
+    Alert.alert('Problème réseau', msg);
+  }
+  console.warn(`Échec SMS à ${phone}:`, msg);
+  failed++;
+} finally {
+  setProgressCount((p) => p + 1);
+  await new Promise((r) => setTimeout(r, 120));
+}
+
     } // ← fin du for
 
     if (sent > 0) { try { await consumeCredits(sent); } catch {} }
