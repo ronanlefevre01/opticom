@@ -81,10 +81,42 @@ const appendSignature = (msg: string, sig: string) => {
   return `${m}${sep}${s}`;
 };
 
+// ===== Helpers (ajoute ceci dans CampagnePage.tsx) =====
+const getRawPhone = (c: any): string => {
+  const candidates: any[] = [
+    c?.telephone, c?.phoneNumber, c?.phone, c?.mobile, c?.portable, c?.gsm,
+    c?.tel, c?.tel1, c?.tel2, c?.numero, c?.num, c?.numTel, c?.numTelephone,
+    c?.contact?.phone, c?.contact?.mobile,
+    c?.coordonnees?.telephone, c?.coordonnees?.mobile,
+  ].filter(Boolean);
+
+  for (const v of candidates) {
+    const s = String(v);
+    const m = s.match(/\+33\s?[1-9](?:[\s.-]?\d){8}|0[1-9](?:[\s.-]?\d){8}/);
+    if (m) return m[0];
+  }
+  try {
+    const flat = JSON.stringify(c);
+    const m = flat.match(/\+33\s?[1-9](?:[\s.-]?\d){8}|0[1-9](?:[\s.-]?\d){8}/);
+    if (m) return m[0];
+  } catch {}
+  return '';
+};
+
+const toE164FR = (raw: string): string | null => {
+  const s = String(raw || '').replace(/[^\d+]/g, '');
+  if (/^\+33[1-9]\d{8}$/.test(s)) return s;
+  const d = s.replace(/\D/g, '');
+  if (/^0[1-9]\d{8}$/.test(d)) return '+33' + d.slice(1);
+  if (/^33[1-9]\d{8}$/.test(d)) return '+' + d;
+  return null;
+};
+
+
 const ensureStopClause = (m: string) =>
   /stop\s+au\s+36111/i.test(m) ? m : `${m} STOP au 36111`;
 
-/* ===================== Crédit (server pre-check) ===================== */
+
 /* ===================== Crédit (server pre-check) ===================== */
 const fetchCreditsFromServer = async (licenceId: string): Promise<number | null> => {
   const urls = [
@@ -104,12 +136,6 @@ const fetchCreditsFromServer = async (licenceId: string): Promise<number | null>
   }
   console.warn('Credits endpoint unavailable');
   return null;
-};
-
-const toE164FR = (raw: string): string | null => {
-  const d = sanitizePhone(raw);         // "06XXXXXXXX" → "06XXXXXXXX"
-  if (!/^\d{10}$/.test(d)) return null;
-  return '+33' + d.slice(1);            // 06… → +336…
 };
 
 
@@ -583,7 +609,7 @@ export default function CampagnePage() {
                     }}
                   >
                     <Text style={{ fontSize: 14 }}>
-                      {client.prenom} {client.nom} — {client.telephone}
+                      {client.prenom} {client.nom} — {getRawPhone(client) || '—'}
                     </Text>
                     <Text>{checked ? '✅' : '⬜'}</Text>
                   </TouchableOpacity>
