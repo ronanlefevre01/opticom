@@ -290,30 +290,28 @@ export default function ClientListPage() {
 
       // 2) Historique de la licence (une seule requête)
       const hist = await fetchSmsHistoryFromLicence(licenceId, cle);
-const byPhone = new Map<string, { date: string; label: string }[]>();
+      const byPhone = new Map<string, { date: string; label: string }[]>();
 
-for (const h of hist) {
-  const key = sanitizePhone(h.numero || '');
-  if (!key) continue;
-  const resetAt = resets[key];
-  if (resetAt && new Date(h.date) <= new Date(resetAt)) continue;
+      for (const h of hist) {
+        const key = sanitizePhone(h.numero || '');
+        if (!key) continue;
+        const resetAt = resets[key];
+        if (resetAt && new Date(h.date) <= new Date(resetAt)) continue;
 
-  if (!byPhone.has(key)) byPhone.set(key, []);
-  const label = h.label || labelFromType(h.type);
-  byPhone.get(key)!.push({ date: h.date, label });
-}
-
+        if (!byPhone.has(key)) byPhone.set(key, []);
+        const label = h.label || labelFromType(h.type);
+        byPhone.get(key)!.push({ date: h.date, label });
+      }
 
       // 3) Injecter l’historique
       const withHistory = remote.map(c => {
-  const logs = (byPhone.get(sanitizePhone(c.telephone)) || []).map(l => ({
-    date: l.date,
-    type: l.label,          // ce que tu afficheras (nom de campagne OU libellé du type)
-    campaign: l.label,      // si tu veux aussi garder explicitement le nom
-  }));
-  return { ...c, messagesEnvoyes: logs };
-});
-
+        const logs = (byPhone.get(sanitizePhone(c.telephone)) || []).map(l => ({
+          date: l.date,
+          type: l.label,          // ce que tu afficheras (nom de campagne OU libellé du type)
+          campaign: l.label,      // si tu veux aussi garder explicitement le nom
+        }));
+        return { ...c, messagesEnvoyes: logs };
+      });
 
       // 4) Merger avec local (et migration phone -> telephone)
       const localStr = await AsyncStorage.getItem('clients');
@@ -525,39 +523,38 @@ for (const h of hist) {
   };
 
   const sendOne = async ({
-  licenceId,
-  phoneNumber,
-  message,
-  category,                     // ← nouveau
-}:{
-  licenceId: string;
-  phoneNumber: string;          // attendu 06… côté appelant
-  message: string;
-  category?: string;            // Lunettes | Lentilles | SAV | Commande | 'Marketing' | etc.
-}) => {
-  const e164 = toE164FR(phoneNumber);       // ✅ normalisation systématique
-  const payload: any = {
     licenceId,
-    phoneNumber: e164,                       // ← on envoie E.164 au serveur
+    phoneNumber,
     message,
-    category,                                // ← pour la journalisation/classement
+    category,                     // ← nouveau
+  }:{
+    licenceId: string;
+    phoneNumber: string;          // attendu 06… côté appelant
+    message: string;
+    category?: string;            // Lunettes | Lentilles | SAV | Commande | 'Marketing' | etc.
+  }) => {
+    const e164 = toE164FR(phoneNumber);       // ✅ normalisation systématique
+    const payload: any = {
+      licenceId,
+      phoneNumber: e164,                       // ← on envoie E.164 au serveur
+      message,
+      category,                                // ← pour la journalisation/classement
+    };
+
+    const resp = await fetch(SEND_SMS_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await resp.json().catch(() => ({} as any));
+
+    if (!resp.ok || data?.success === false || data?.ok === false) {
+      const errMsg = data?.error || data?.message || `HTTP ${resp.status}`;
+      throw new Error(errMsg);
+    }
+    return true;
   };
-
-  const resp = await fetch(SEND_SMS_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await resp.json().catch(() => ({} as any));
-
-  if (!resp.ok || data?.success === false || data?.ok === false) {
-    const errMsg = data?.error || data?.message || `HTTP ${resp.status}`;
-    throw new Error(errMsg);
-  }
-  return true;
-};
-
 
   const fetchCreditsFromServer = async (licenceId: string): Promise<number | null> => {
     const urls = [
@@ -630,12 +627,11 @@ for (const h of hist) {
 
         try {
           await sendOne({
-  licenceId,
-  phoneNumber: phone,
-  message,
-  category: category === '__custom__' ? 'Personnalisé' : (category as string),
-});
-
+            licenceId,
+            phoneNumber: phone,
+            message,
+            category: category === '__custom__' ? 'Personnalisé' : (category as string),
+          });
 
           const idx = updated.findIndex((u) => sanitizePhone(u.telephone) === phone);
           if (idx !== -1) {
@@ -724,6 +720,10 @@ for (const h of hist) {
     </View>
   );
 
+  // ======== NOUVEAU: bouton toujours visible mais inactif si aucune sélection ========
+  const selectedCount = selectedClients.length;
+  const hasSelection = selectedCount > 0;
+
   return (
     <View style={styles.container}>
       <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -767,13 +767,19 @@ for (const h of hist) {
         renderItem={renderItem}
       />
 
-      {selectedClients.length > 0 && (
-        <View style={{ marginTop: 14 }}>
-          <TouchableOpacity style={styles.smsButton} onPress={openSmsDialog}>
-            <Text style={styles.smsText}>Envoyer SMS</Text>
-          </TouchableOpacity>
-        </View>
-      )}
+      {/* Bouton toujours visible, grisé quand aucun client sélectionné */}
+      <View style={{ marginTop: 14 }}>
+        <TouchableOpacity
+          style={[styles.smsButton, !hasSelection && styles.smsButtonDisabled]}
+          onPress={openSmsDialog}
+          disabled={!hasSelection}
+          accessibilityState={{ disabled: !hasSelection }}
+        >
+          <Text style={styles.smsText}>
+            Envoyer SMS{hasSelection ? ` (${selectedCount})` : ''}
+          </Text>
+        </TouchableOpacity>
+      </View>
 
       {/* Modale type */}
       <Modal visible={typeModalVisible} transparent animationType="fade" onRequestClose={() => setTypeModalVisible(false)}>
@@ -881,6 +887,7 @@ const styles = StyleSheet.create({
   smsHistory: { marginTop: 4, paddingLeft: 10 },
   smsHistoryText: { fontSize: 13, color: '#aaa' },
   smsButton: { backgroundColor: '#00BFFF', padding: 14, borderRadius: 10, alignItems: 'center' },
+  smsButtonDisabled: { backgroundColor: '#3a3a3a', opacity: 0.6 }, // ← ajouté pour l’état grisé
   smsText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
 
   // Sync
