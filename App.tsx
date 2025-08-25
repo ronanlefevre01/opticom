@@ -27,6 +27,10 @@ import MandateValidationPage from './MandateValidationPage';
 // 🔄 Sync auto (étape 2)
 import { ClientsSyncProvider } from './src/sync/ClientsSyncContext';
 
+// 🔐 Licence guard (redirige vers LicenceCheckPage si licence supprimée côté serveur)
+import { navigationRef } from './src/navigationRef';
+import { startLicenceGuard } from './src/lib/licenceGuard';
+
 if (Platform.OS === 'web') {
   // @ts-ignore
   require('./app.web.css');
@@ -150,6 +154,12 @@ export default function App() {
     })();
   }, []);
 
+  // 🔐 Démarre le licence guard (redirige automatiquement si licence supprimée)
+  useEffect(() => {
+    const stop = startLicenceGuard();
+    return stop;
+  }, []);
+
   // Linking: ignorer les liens vers les écrans "licence" si déjà licencié
   const linking = useMemo(() => {
     const isLicencePath = (url: string) => {
@@ -187,7 +197,7 @@ export default function App() {
 
   return (
     <ClientsSyncProvider>
-      <NavigationContainer linking={linking}>
+      <NavigationContainer linking={linking} ref={navigationRef}>
         <Stack.Navigator
           screenOptions={{ headerShown: false }}
           initialRouteName={hasLicense ? 'Home' : 'LicenceCheckPage'}
