@@ -9,8 +9,6 @@ import { useNavigation, NavigationProp } from '@react-navigation/native';
 
 import type { Client, SMSCategory } from './types';
 import API_BASE from './src/config/api';
-
-// service clients (cache + dedoublonnage)
 import { fetchClientsOnce, type ClientRow } from './src/services/clients';
 
 type RootStackParamList = {
@@ -27,8 +25,6 @@ const sanitizePhone = (raw: string) => {
   return p.replace(/\D/g, '');
 };
 const isPhone10 = (p: string) => /^\d{10}$/.test(p);
-
-// E.164 FR
 const toE164FR = (raw: string) => {
   const p = sanitizePhone(raw);
   if (/^0\d{9}$/.test(p)) return '+33' + p.slice(1);
@@ -36,12 +32,10 @@ const toE164FR = (raw: string) => {
   if (/^33\d{9}$/.test(p)) return '+' + p;
   return p;
 };
-
-// confirm cross-platform (Web/Native)
 const confirmAsync = (title: string, message: string, okText = 'Supprimer') =>
   new Promise<boolean>((resolve) => {
     if (Platform.OS === 'web') {
-      // @ts-ignore web only
+      // @ts-ignore web-only
       resolve(window.confirm(`${title}\n\n${message}`));
     } else {
       Alert.alert(title, message, [
@@ -67,7 +61,6 @@ const getSignatureFromSettings = async (): Promise<string> => {
   }
 };
 
-// version 100% ASCII (evite les soucis d'encodage)
 const appendSignature = (msg: string, sig: string) => {
   const m = (msg || '').trim();
   const s = (sig || '').trim();
@@ -79,7 +72,7 @@ const appendSignature = (msg: string, sig: string) => {
   return `${m}${sep}${s}`;
 };
 
-/** ✅ Résout un licenceId stable et le *cache* (évite les requêtes répétées) */
+/** LicenceId stable (avec cache local) */
 const getStableLicenceId = async (): Promise<string | null> => {
   try {
     const cached = await AsyncStorage.getItem('licenceId');
@@ -120,10 +113,11 @@ const getStableLicenceId = async (): Promise<string | null> => {
 /** ---- Historique SMS depuis la licence ---- */
 type ServerSmsItem = {
   date: string;
-  type: string;
+  type: string;   // 'marketing' | 'transactional' | 'auto-anniv' | 'auto-renew' | ...
   numero: string;
-  campaignName?: string; campaign?: string; title?: string; nom?: string; name?: string;
+  campaignName?: string; campaign?: string; title?: string; nom?: string; name?: string; template?: string;
 };
+
 const labelFromType = (t: string) => {
   if (t === 'marketing') return 'Marketing';
   if (t === 'transactional') return 'Transactionnel';
@@ -131,6 +125,20 @@ const labelFromType = (t: string) => {
   if (t === 'auto-renew') return 'Renouvellement auto';
   return 'SMS';
 };
+
+/** essaie d’inférer une catégorie lisible pour l’historique */
+const coerceHistoryLabel = (rawType: string, label: string) => {
+  const knownCats = ['Lunettes','Lentilles','SAV','Commande'] as const;
+  if (knownCats.includes(label as any)) return label;        // correspond à nos modèles
+  // sinon, basé sur le type serveur
+  if (rawType === 'marketing') return 'Marketing';
+  if (rawType === 'transactional') return 'Transactionnel';
+  if (rawType === 'auto-anniv') return 'Anniv auto';
+  if (rawType === 'auto-renew') return 'Renouvellement auto';
+  // à défaut, garder le label de campagne si présent, sinon "SMS"
+  return label || 'SMS';
+};
+
 const fetchSmsHistoryFromLicence = async (
   licenceId: string,
   cle?: string | null
@@ -153,22 +161,7 @@ const fetchSmsHistoryFromLicence = async (
       const data = await r.json();
       const lic = data?.licence ?? data;
       const items: any[] = Array.isArray(lic?.historiqueSms) ? lic.historiqueSms : [];
-
-      const normalized: ServerSmsItem[] = items.map((h: any) => {
-        const base = labelFromType(h?.type);
-        const rawName =
-          h?.campaignName || h?.campaign || h?.title || h?.nom || h?.name || h?.template || '';
-        const label = rawName ? String(rawName) : base;
-
-        return {
-          date: String(h?.date || ''),
-          type: String(h?.type || ''),
-          numero: String(h?.numero || ''),
-          label,
-        };
-      });
-
-      return normalized;
+      return items as ServerSmsItem[];
     } catch {}
   }
   return [];
@@ -176,21 +169,32 @@ const fetchSmsHistoryFromLicence = async (
 
 /* ---- mapping service row -> Client local ---- */
 const rowToClient = (s: ClientRow): Client => {
-  const tel = sanitizePhone(s.telephone || s.phone || '');
+  const tel = sanitizePhone((s as any).telephone || (s as any).phone || (s as any).numero || '');
+  const birth =
+    (s as any).dateNaissance || (s as any).naissance || (s as any).birthday || '';
+
+  const srvMarketing =
+    !!(s as any)?.consent?.marketing_sms?.value || !!(s as any)?.consentementMarketing;
+  const srvService =
+    (s as any)?.consent?.service_sms?.value ?? (s as any)?.consentementService ?? true;
+
   return {
-    id: String(s.id || tel || ''),
-    prenom: s.prenom || '',
-    nom: s.nom || '',
+    id: String((s as any).id || tel || ''),
+    prenom: (s as any).prenom || '',
+    nom: (s as any).nom || '',
     telephone: tel,
-    email: s.email || '',
-    dateNaissance: '',
-    lunettes: false,
-    lentilles: [],
-    consentementMarketing: false,
-    consent: { service_sms: { value: true }, marketing_sms: { value: false } },
-    messagesEnvoyes: [],
-    createdAt: s.updatedAt || new Date().toISOString(),
-    updatedAt: s.updatedAt || new Date().toISOString(),
+    email: (s as any).email || '',
+    dateNaissance: birth,
+    lunettes: !!(s as any).lunettes,
+    lentilles: Array.isArray((s as any).lentilles) ? (s as any).lentilles : [],
+    consentementMarketing: srvMarketing,
+    consent: {
+      service_sms:   { value: !!srvService },
+      marketing_sms: { value: !!srvMarketing },
+    },
+    messagesEnvoyes: Array.isArray((s as any).messagesEnvoyes) ? (s as any).messagesEnvoyes : [],
+    createdAt: (s as any).createdAt || (s as any).updatedAt || new Date().toISOString(),
+    updatedAt: (s as any).updatedAt || new Date().toISOString(),
   };
 };
 
@@ -233,7 +237,7 @@ const DEFAULT_TEMPLATES: Record<SMSCategory, string> = {
   Commande:  'Bonjour {prenom} {nom}, votre commande est arrivée !',
 };
 
-/* ======= NOUVEAU : modes de tri ======= */
+/* ======= Tri ======= */
 type SortMode =
   | 'NAME_ASC'
   | 'NAME_DESC'
@@ -264,10 +268,7 @@ export default function ClientListPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedClients, setSelectedClients] = useState<string[]>([]);
   const [smsFilter, setSmsFilter] = useState<SMSCategory | 'Tous'>('Tous');
-
-  // NEW: tri
   const [sortMode, setSortMode] = useState<SortMode>('NAME_ASC');
-
   const [customMessages, setCustomMessages] = useState<Record<string, string | { title?: string; content: string }>>({});
 
   // Progress
@@ -280,16 +281,20 @@ export default function ClientListPage() {
 
   const [customModalVisible, setCustomModalVisible] = useState(false);
   const [customText, setCustomText] = useState('');
-
-  // modale choix de type
   const [typeModalVisible, setTypeModalVisible] = useState(false);
 
-  // sync state / garde-fou
+  // --- Preview ---
+  const [previewVisible, setPreviewVisible] = useState(false);
+  const [previewCategory, setPreviewCategory] = useState<SMSCategory | '__custom__' | null>(null);
+  const [previewItems, setPreviewItems] = useState<{ name: string; phone: string; message: string }[]>([]);
+  const [previewTotal, setPreviewTotal] = useState(0);
+  const PREVIEW_LIMIT = 8;
+
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
   const inFlightRef = useRef(false);
 
-  /** ---- SYNCHRO (1 seule requête grâce au service) ---- */
+  /** ---- SYNCHRO ---- */
   const syncFromServer = useCallback(async (force = false) => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
@@ -297,50 +302,49 @@ export default function ClientListPage() {
       setSyncing(true);
       setSyncError(null);
 
-      // licenceId stable
       const licStr = await AsyncStorage.getItem('licence');
       const lic = licStr ? JSON.parse(licStr) : null;
       const cle = String(lic?.licence || '').trim() || null;
       const licenceId = await getStableLicenceId();
       if (!licenceId) { setSyncError('Licence introuvable'); return; }
 
-      // tombstones & resets (local)
       const [tombstones, resets] = await Promise.all([loadTombstones(), loadHistoryResets()]);
       const tombstoneSet = new Set(tombstones);
 
-      // 1) Clients via service (cache TTL 15 s + dédoublonnage)
+      // 1) Clients via service
       const rows = await fetchClientsOnce(licenceId, { force });
       const remote = (rows || [])
-        .filter(r => !r.deletedAt)
+        .filter(r => !(r as any).deletedAt)
         .map(rowToClient)
         .filter(c => !tombstoneSet.has(sanitizePhone(c.telephone)));
 
-      // 2) Historique de la licence (une seule requête)
+      // 2) Historique licence
       const hist = await fetchSmsHistoryFromLicence(licenceId, cle);
-      const byPhone = new Map<string, { date: string; label: string }[]>();
-
+      const byPhone = new Map<string, { date: string; type: string }[]>();
       for (const h of hist) {
         const key = sanitizePhone(h.numero || '');
         if (!key) continue;
         const resetAt = resets[key];
         if (resetAt && new Date(h.date) <= new Date(resetAt)) continue;
 
+        const rawLabel =
+          h.campaignName || h.campaign || h.title || h.nom || h.name || h.template || '';
+        const coerced = coerceHistoryLabel(h.type, rawLabel);
+
         if (!byPhone.has(key)) byPhone.set(key, []);
-        const label = h.label || labelFromType(h.type);
-        byPhone.get(key)!.push({ date: h.date, label });
+        byPhone.get(key)!.push({ date: String(h.date || ''), type: coerced });
       }
 
       // 3) Injecter l’historique
       const withHistory = remote.map(c => {
         const logs = (byPhone.get(sanitizePhone(c.telephone)) || []).map(l => ({
           date: l.date,
-          type: l.label,
-          campaign: l.label,
+          type: l.type,     // "Lunettes"/"Lentilles"/"SAV"/"Commande"/"Marketing"/...
         }));
         return { ...c, messagesEnvoyes: logs };
       });
 
-      // 4) Merger avec local (et migration phone -> telephone)
+      // 4) Merge avec local en PRÉSERVANT le local
       const localStr = await AsyncStorage.getItem('clients');
       const localRaw: any[] = localStr ? JSON.parse(localStr) : [];
       const local: Client[] = (Array.isArray(localRaw) ? localRaw : []).map((l: any) => {
@@ -349,27 +353,53 @@ export default function ClientListPage() {
       });
 
       const mergedByPhone = new Map<string, Client>();
-      for (const s of withHistory) mergedByPhone.set(sanitizePhone(s.telephone), s);
+      for (const r of withHistory) mergedByPhone.set(sanitizePhone(r.telephone), r);
+
       for (const l of local) {
         const key = sanitizePhone(l.telephone);
         if (!key) continue;
-        if (!mergedByPhone.has(key)) mergedByPhone.set(key, l);
-        else {
-          const cur = mergedByPhone.get(key)!;
-          const seen = new Set((cur.messagesEnvoyes || []).map(m => `${m.type}|${m.date}`));
-          const out = [...(cur.messagesEnvoyes || [])];
-          for (const m of (l.messagesEnvoyes || [])) {
-            const id = `${m.type}|${m.date}`;
-            if (!seen.has(id)) out.push(m);
-          }
-          mergedByPhone.set(key, { ...cur, messagesEnvoyes: out });
-        }
-      }
-      const merged = Array.from(mergedByPhone.values());
+        const cur = mergedByPhone.get(key);
 
+        if (!cur) {
+          mergedByPhone.set(key, l);
+          continue;
+        }
+
+        const svcLocal = !!l?.consent?.service_sms?.value;
+        const mktLocal = !!l?.consent?.marketing_sms?.value || !!l?.consentementMarketing;
+        const svcRemote = !!cur?.consent?.service_sms?.value;
+        const mktRemote = !!cur?.consent?.marketing_sms?.value || !!cur?.consentementMarketing;
+
+        const merged: Client = {
+          ...cur,
+          ...l, // le local écrase par défaut les champs simples
+          dateNaissance: l.dateNaissance || cur.dateNaissance || '',
+          lunettes: l.lunettes ?? cur.lunettes,
+          lentilles: (l.lentilles && l.lentilles.length) ? l.lentilles : cur.lentilles,
+          consentementMarketing: mktLocal || mktRemote,
+          consent: {
+            service_sms:   { value: svcLocal || svcRemote },
+            marketing_sms: { value: mktLocal || mktRemote },
+          },
+          messagesEnvoyes: (() => {
+            const a = Array.isArray(cur.messagesEnvoyes) ? cur.messagesEnvoyes : [];
+            const b = Array.isArray(l.messagesEnvoyes) ? l.messagesEnvoyes : [];
+            const seen = new Set(a.map(m => `${m.type}|${m.date}`));
+            const out = [...a];
+            for (const m of b) {
+              const id = `${m.type}|${m.date}`;
+              if (!seen.has(id)) out.push(m);
+            }
+            return out;
+          })(),
+        };
+
+        mergedByPhone.set(key, merged);
+      }
+
+      const merged = Array.from(mergedByPhone.values());
       await AsyncStorage.setItem('clients', JSON.stringify(merged));
       setClients(merged);
-      // le filtrage/tri sera appliqué par l'autre useEffect
     } catch (e: any) {
       setSyncError(e?.message || 'Erreur inconnue');
     } finally {
@@ -378,7 +408,7 @@ export default function ClientListPage() {
     }
   }, []);
 
-  // Chargement local + première synchro (force) au montage
+  // Chargement local + première synchro
   useEffect(() => {
     (async () => {
       const clientData = await AsyncStorage.getItem('clients');
@@ -403,7 +433,7 @@ export default function ClientListPage() {
     })();
   }, [syncFromServer]);
 
-  // Filtrage + Tri (regroupe tout au même endroit)
+  // Filtrage + Tri
   useEffect(() => {
     const lower = searchQuery.toLowerCase();
 
@@ -420,7 +450,6 @@ export default function ClientListPage() {
       );
     }
 
-    // Tri
     result = [...result].sort((a, b) => {
       switch (sortMode) {
         case 'NAME_ASC':
@@ -430,22 +459,22 @@ export default function ClientListPage() {
         case 'LAST_SMS_DESC': {
           const ta = getLastSmsDate(a), tb = getLastSmsDate(b);
           if (ta === tb) return safeName(a).localeCompare(safeName(b), 'fr', { sensitivity: 'base' });
-          return tb - ta; // récent d'abord
+          return tb - ta;
         }
         case 'LAST_SMS_ASC': {
           const ta = getLastSmsDate(a), tb = getLastSmsDate(b);
           if (ta === tb) return safeName(a).localeCompare(safeName(b), 'fr', { sensitivity: 'base' });
-          return ta - tb; // ancien d'abord
+          return ta - tb;
         }
         case 'CREATED_DESC': {
           const ta = safeDate(a.createdAt), tb = safeDate(b.createdAt);
           if (ta === tb) return safeName(a).localeCompare(safeName(b), 'fr', { sensitivity: 'base' });
-          return tb - ta; // nouveaux d'abord
+          return tb - ta;
         }
         case 'CREATED_ASC': {
           const ta = safeDate(a.createdAt), tb = safeDate(b.createdAt);
           if (ta === tb) return safeName(a).localeCompare(safeName(b), 'fr', { sensitivity: 'base' });
-          return ta - tb; // anciens d'abord
+          return ta - tb;
         }
         default:
           return 0;
@@ -573,6 +602,33 @@ export default function ClientListPage() {
     setTypeModalVisible(true);
   };
 
+  /** Construit la prévisualisation pour les clients sélectionnés (sans envoyer) */
+  const openPreviewForCategory = async (category: SMSCategory | '__custom__') => {
+    const batch = clients.filter((c) => selectedClients.includes(sanitizePhone(c.telephone)));
+    if (batch.length === 0) {
+      Alert.alert('Info', 'Selectionne au moins un client.');
+      return;
+    }
+
+    const signature = await getSignatureFromSettings();
+
+    const items = batch.slice(0, PREVIEW_LIMIT).map((c) => {
+      const tpl = category === '__custom__' ? (customText || '') : getTemplateString(category as SMSCategory);
+      let message = buildMessageForClient(tpl, c);
+      message = appendSignature(message, signature);
+      return {
+        name: `${c.prenom ?? ''} ${c.nom ?? ''}`.trim() || '(sans nom)',
+        phone: sanitizePhone(c.telephone || ''),
+        message,
+      };
+    });
+
+    setPreviewItems(items);
+    setPreviewTotal(batch.length);
+    setPreviewCategory(category);
+    setPreviewVisible(true);
+  };
+
   const sendOne = async ({
     licenceId,
     phoneNumber,
@@ -599,7 +655,6 @@ export default function ClientListPage() {
     });
 
     const data = await resp.json().catch(() => ({} as any));
-
     if (!resp.ok || data?.success === false || data?.ok === false) {
       const errMsg = data?.error || data?.message || `HTTP ${resp.status}`;
       throw new Error(errMsg);
@@ -634,10 +689,7 @@ export default function ClientListPage() {
     }
 
     const licenceId = await getStableLicenceId();
-    if (!licenceId) {
-      Alert.alert('Erreur', 'Licence introuvable.');
-      return;
-    }
+    if (!licenceId) { Alert.alert('Erreur', 'Licence introuvable.'); return; }
 
     const credits = await fetchCreditsFromServer(licenceId);
     if (credits !== null && credits < batch.length) {
@@ -649,6 +701,7 @@ export default function ClientListPage() {
 
     setSending(true);
     setTypeModalVisible(false);
+    setPreviewVisible(false);
     setSendError(null);
     setSendStep('prep');
     setProgressTotal(batch.length);
@@ -775,7 +828,6 @@ export default function ClientListPage() {
 
   return (
     <View style={styles.container}>
-      {/* Barre de titre + Sync */}
       <View style={styles.headerRow}>
         <Text style={styles.title}>Mes Clients</Text>
         <TouchableOpacity onPress={() => syncFromServer(true)} style={styles.syncBtn} disabled={syncing}>
@@ -788,63 +840,39 @@ export default function ClientListPage() {
         <Text style={styles.homeButtonText}>← Accueil</Text>
       </TouchableOpacity>
 
-      {/* NOUVEAU : Barre d’actions en haut avec le bouton d’envoi */}
       <View style={styles.topActionBar}>
-        {/* Contrôles de tri */}
         <View style={styles.sortRow}>
           <Text style={styles.sortLabel}>Trier :</Text>
-          <TouchableOpacity
-            style={[styles.sortChip, sortMode === 'NAME_ASC' && styles.sortChipActive]}
-            onPress={() => setSortMode('NAME_ASC')}
-          >
+          <TouchableOpacity style={[styles.sortChip, sortMode === 'NAME_ASC' && styles.sortChipActive]} onPress={() => setSortMode('NAME_ASC')}>
             <Text style={styles.sortChipText}>A → Z</Text>
           </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.sortChip, sortMode === 'NAME_DESC' && styles.sortChipActive]}
-            onPress={() => setSortMode('NAME_DESC')}
-          >
+          <TouchableOpacity style={[styles.sortChip, sortMode === 'NAME_DESC' && styles.sortChipActive]} onPress={() => setSortMode('NAME_DESC')}>
             <Text style={styles.sortChipText}>Z → A</Text>
           </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.sortChip, sortMode === 'LAST_SMS_DESC' && styles.sortChipActive]}
-            onPress={() => setSortMode('LAST_SMS_DESC')}
-          >
+          <TouchableOpacity style={[styles.sortChip, sortMode === 'LAST_SMS_DESC' && styles.sortChipActive]} onPress={() => setSortMode('LAST_SMS_DESC')}>
             <Text style={styles.sortChipText}>Dernier SMS</Text>
           </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.sortChip, sortMode === 'LAST_SMS_ASC' && styles.sortChipActive]}
-            onPress={() => setSortMode('LAST_SMS_ASC')}
-          >
+          <TouchableOpacity style={[styles.sortChip, sortMode === 'LAST_SMS_ASC' && styles.sortChipActive]} onPress={() => setSortMode('LAST_SMS_ASC')}>
             <Text style={styles.sortChipText}>Premier SMS</Text>
           </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.sortChip, sortMode === 'CREATED_DESC' && styles.sortChipActive]}
-            onPress={() => setSortMode('CREATED_DESC')}
-          >
+          <TouchableOpacity style={[styles.sortChip, sortMode === 'CREATED_DESC' && styles.sortChipActive]} onPress={() => setSortMode('CREATED_DESC')}>
             <Text style={styles.sortChipText}>Récents</Text>
           </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.sortChip, sortMode === 'CREATED_ASC' && styles.sortChipActive]}
-            onPress={() => setSortMode('CREATED_ASC')}
-          >
+          <TouchableOpacity style={[styles.sortChip, sortMode === 'CREATED_ASC' && styles.sortChipActive]} onPress={() => setSortMode('CREATED_ASC')}>
             <Text style={styles.sortChipText}>Anciens</Text>
           </TouchableOpacity>
         </View>
 
-        {/* Bouton d’envoi en haut à droite */}
         <TouchableOpacity
           style={[styles.smsButtonTop, !hasSelection && styles.smsButtonDisabled]}
           onPress={openSmsDialog}
           disabled={!hasSelection}
           accessibilityState={{ disabled: !hasSelection }}
         >
-          <Text style={styles.smsText}>
-            Envoyer SMS{hasSelection ? ` (${selectedCount})` : ''}
-          </Text>
+          <Text style={styles.smsText}>Envoyer SMS{hasSelection ? ` (${selectedCount})` : ''}</Text>
         </TouchableOpacity>
       </View>
 
-      {/* Recherche + Filtres */}
       <TextInput
         style={styles.searchInput}
         placeholder="Rechercher un client..."
@@ -873,13 +901,17 @@ export default function ClientListPage() {
         renderItem={renderItem}
       />
 
-      {/* Modale type */}
+      {/* Modale choix type -> ouvre la PREVIEW, ne lance plus l’envoi direct */}
       <Modal visible={typeModalVisible} transparent animationType="fade" onRequestClose={() => setTypeModalVisible(false)}>
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
             <Text style={styles.customTitle}>Type de message</Text>
             {(['Lunettes','SAV','Lentilles','Commande'] as const).map((t) => (
-              <TouchableOpacity key={t} style={styles.typeBtn} onPress={() => sendBatch(t)}>
+              <TouchableOpacity
+                key={t}
+                style={styles.typeBtn}
+                onPress={() => { setTypeModalVisible(false); setTimeout(() => openPreviewForCategory(t), 50); }}
+              >
                 <Text style={styles.customBtnText}>{t}</Text>
               </TouchableOpacity>
             ))}
@@ -899,7 +931,7 @@ export default function ClientListPage() {
         </View>
       </Modal>
 
-      {/* Modale “Personnalisé” */}
+      {/* Modale “Personnalisé” -> déclenche PREVIEW */}
       <Modal visible={customModalVisible} transparent animationType="fade" onRequestClose={() => setCustomModalVisible(false)}>
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
@@ -916,15 +948,65 @@ export default function ClientListPage() {
             <View style={styles.customRow}>
               <TouchableOpacity
                 style={[styles.customBtn, { backgroundColor: '#28a745' }]}
-                onPress={() => { setCustomModalVisible(false); setTimeout(() => sendBatch('__custom__'), 60); }}
+                onPress={() => { setCustomModalVisible(false); setTimeout(() => openPreviewForCategory('__custom__'), 50); }}
               >
-                <Text style={styles.customBtnText}>Envoyer</Text>
+                <Text style={styles.customBtnText}>Prévisualiser</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.customBtn, { backgroundColor: '#555' }]}
                 onPress={() => setCustomModalVisible(false)}
               >
                 <Text style={styles.customBtnText}>Fermer</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Modale Prévisualisation (avant la modale de progress) */}
+      <Modal visible={previewVisible} transparent animationType="fade" onRequestClose={() => setPreviewVisible(false)}>
+        <View style={styles.customOverlay}>
+          <View style={[styles.customCard, { width: '90%' }]}>
+            <Text style={styles.customTitle}>Prévisualisation</Text>
+            <Text style={styles.customHint}>
+              Type : {previewCategory === '__custom__' ? 'Personnalisé' : previewCategory} — Destinataires : {previewTotal}
+            </Text>
+
+            <View style={{ maxHeight: 320, marginTop: 10 }}>
+              {previewItems.map((it, idx) => (
+                <View
+                  key={idx}
+                  style={{ marginBottom: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#333', paddingBottom: 8 }}
+                >
+                  <Text style={{ color: '#cdeafe', fontWeight: '700' }}>
+                    {it.name} ({it.phone})
+                  </Text>
+                  <Text style={{ color: '#eee', marginTop: 4 }}>{it.message}</Text>
+                </View>
+              ))}
+              {previewTotal > previewItems.length && (
+                <Text style={{ color: '#bbb', marginTop: 4 }}>
+                  … et {previewTotal - previewItems.length} autres.
+                </Text>
+              )}
+            </View>
+
+            <View style={styles.customRow}>
+              <TouchableOpacity
+                style={[styles.customBtn, { backgroundColor: '#28a745' }]}
+                onPress={() => {
+                  const cat = previewCategory;
+                  setPreviewVisible(false);
+                  if (cat) setTimeout(() => sendBatch(cat), 60);
+                }}
+              >
+                <Text style={styles.customBtnText}>Confirmer l’envoi</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.customBtn, { backgroundColor: '#555' }]}
+                onPress={() => setPreviewVisible(false)}
+              >
+                <Text style={styles.customBtnText}>Annuler</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -960,21 +1042,12 @@ export default function ClientListPage() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, padding: 20, backgroundColor: '#000' },
-
   headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   title: { fontSize: 22, fontWeight: 'bold', color: '#fff', marginBottom: 8 },
   homeButton: { alignSelf: 'flex-start', paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#1a1a1a', borderRadius: 6, marginBottom: 12, marginTop: 8 },
   homeButtonText: { fontSize: 14, color: '#00BFFF' },
 
-  // Top bar (tri + bouton envoyer)
-  topActionBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 10,
-    marginBottom: 12,
-    flexWrap: 'wrap',
-  },
+  topActionBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 12, flexWrap: 'wrap' },
   sortRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6, flex: 1 },
   sortLabel: { color: '#ddd', marginRight: 6 },
   sortChip: { backgroundColor: '#1f2937', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 999 },
