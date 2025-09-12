@@ -18,8 +18,6 @@ type RootStackParamList = {
   ClientDetails: { client: Client };
 };
 
-const navigation = useNavigation<NavigationProp<RootStackParamList>>();
-
 const SEND_SMS_ENDPOINT = `${API_BASE}/send-sms`;
 
 /* ------------ helpers ------------- */
@@ -259,7 +257,7 @@ function safeDate(s?: string): number {
 }
 
 export default function ClientListPage() {
-  const navigation = useNavigation<NavigationProps>();
+  const navigation = useNavigation<NavigationProp<RootStackParamList>>();
 
   const [clients, setClients] = useState<Client[]>([]);
   const [filteredClients, setFilteredClients] = useState<Client[]>([]);
