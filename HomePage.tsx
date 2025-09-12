@@ -168,7 +168,7 @@ export default function HomePage() {
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.gridButton} onPress={() => navigation.navigate('ClientList')}>
-          <Text style={styles.buttonText}>📋 Voir les clients</Text>
+          <Text style={styles.buttonText}>📋 Voir les clients / Evoyer des messages</Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.gridButton} onPress={() => navigation.navigate('Subscription')}>

@@ -5,14 +5,20 @@ import {
   TextInput, Modal, ActivityIndicator, Platform, Alert,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, NavigationProp } from '@react-navigation/native';
 
 import type { Client, SMSCategory } from './types';
-import type { NavigationProps } from './navigationTypes';
 import API_BASE from './src/config/api';
 
 // service clients (cache + dedoublonnage)
 import { fetchClientsOnce, type ClientRow } from './src/services/clients';
+
+type RootStackParamList = {
+  Home: undefined;
+  ClientDetails: { client: Client };
+};
+
+const navigation = useNavigation<NavigationProp<RootStackParamList>>();
 
 const SEND_SMS_ENDPOINT = `${API_BASE}/send-sms`;
 
@@ -118,7 +124,6 @@ type ServerSmsItem = {
   date: string;
   type: string;
   numero: string;
-  // quelques alias possibles renvoyés par le serveur
   campaignName?: string; campaign?: string; title?: string; nom?: string; name?: string;
 };
 const labelFromType = (t: string) => {
@@ -151,9 +156,8 @@ const fetchSmsHistoryFromLicence = async (
       const lic = data?.licence ?? data;
       const items: any[] = Array.isArray(lic?.historiqueSms) ? lic.historiqueSms : [];
 
-      // ✅ Normalisation : ajoute label = nom de campagne si présent, sinon libellé du type
       const normalized: ServerSmsItem[] = items.map((h: any) => {
-        const base = labelFromType(h?.type); // ex: "Marketing", "Transactionnel", "Anniv auto", etc.
+        const base = labelFromType(h?.type);
         const rawName =
           h?.campaignName || h?.campaign || h?.title || h?.nom || h?.name || h?.template || '';
         const label = rawName ? String(rawName) : base;
@@ -171,7 +175,6 @@ const fetchSmsHistoryFromLicence = async (
   }
   return [];
 };
-
 
 /* ---- mapping service row -> Client local ---- */
 const rowToClient = (s: ClientRow): Client => {
@@ -194,8 +197,8 @@ const rowToClient = (s: ClientRow): Client => {
 };
 
 /* ---- tombstones & resets locaux ---- */
-const KEY_CLIENT_TOMBSTONES = 'clients.tombstones';           // téléphones sanitisés
-const KEY_SMS_HISTORY_RESETS = 'smsHistory.resets';           // phone -> ISO date
+const KEY_CLIENT_TOMBSTONES = 'clients.tombstones';
+const KEY_SMS_HISTORY_RESETS = 'smsHistory.resets';
 type ResetMap = Record<string, string>;
 
 async function loadTombstones(): Promise<string[]> {
@@ -232,6 +235,29 @@ const DEFAULT_TEMPLATES: Record<SMSCategory, string> = {
   Commande:  'Bonjour {prenom} {nom}, votre commande est arrivée !',
 };
 
+/* ======= NOUVEAU : modes de tri ======= */
+type SortMode =
+  | 'NAME_ASC'
+  | 'NAME_DESC'
+  | 'LAST_SMS_DESC'
+  | 'LAST_SMS_ASC'
+  | 'CREATED_DESC'
+  | 'CREATED_ASC';
+
+function getLastSmsDate(c: Client): number {
+  const arr = Array.isArray(c.messagesEnvoyes) ? c.messagesEnvoyes : [];
+  if (!arr.length) return 0;
+  const ts = Math.max(...arr.map(m => new Date(m.date).getTime() || 0));
+  return isFinite(ts) ? ts : 0;
+}
+function safeName(c: Client): string {
+  return `${(c.nom||'').toLowerCase()} ${(c.prenom||'').toLowerCase()}`.trim();
+}
+function safeDate(s?: string): number {
+  const t = s ? new Date(s).getTime() : 0;
+  return isFinite(t) ? t : 0;
+}
+
 export default function ClientListPage() {
   const navigation = useNavigation<NavigationProps>();
 
@@ -240,6 +266,9 @@ export default function ClientListPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedClients, setSelectedClients] = useState<string[]>([]);
   const [smsFilter, setSmsFilter] = useState<SMSCategory | 'Tous'>('Tous');
+
+  // NEW: tri
+  const [sortMode, setSortMode] = useState<SortMode>('NAME_ASC');
 
   const [customMessages, setCustomMessages] = useState<Record<string, string | { title?: string; content: string }>>({});
 
@@ -284,7 +313,7 @@ export default function ClientListPage() {
       // 1) Clients via service (cache TTL 15 s + dédoublonnage)
       const rows = await fetchClientsOnce(licenceId, { force });
       const remote = (rows || [])
-        .filter(r => !r.deletedAt) // sécurité
+        .filter(r => !r.deletedAt)
         .map(rowToClient)
         .filter(c => !tombstoneSet.has(sanitizePhone(c.telephone)));
 
@@ -307,8 +336,8 @@ export default function ClientListPage() {
       const withHistory = remote.map(c => {
         const logs = (byPhone.get(sanitizePhone(c.telephone)) || []).map(l => ({
           date: l.date,
-          type: l.label,          // ce que tu afficheras (nom de campagne OU libellé du type)
-          campaign: l.label,      // si tu veux aussi garder explicitement le nom
+          type: l.label,
+          campaign: l.label,
         }));
         return { ...c, messagesEnvoyes: logs };
       });
@@ -328,7 +357,6 @@ export default function ClientListPage() {
         if (!key) continue;
         if (!mergedByPhone.has(key)) mergedByPhone.set(key, l);
         else {
-          // fusion messagesEnvoyes
           const cur = mergedByPhone.get(key)!;
           const seen = new Set((cur.messagesEnvoyes || []).map(m => `${m.type}|${m.date}`));
           const out = [...(cur.messagesEnvoyes || [])];
@@ -343,7 +371,7 @@ export default function ClientListPage() {
 
       await AsyncStorage.setItem('clients', JSON.stringify(merged));
       setClients(merged);
-      setFilteredClients(merged);
+      // le filtrage/tri sera appliqué par l'autre useEffect
     } catch (e: any) {
       setSyncError(e?.message || 'Erreur inconnue');
     } finally {
@@ -360,42 +388,74 @@ export default function ClientListPage() {
       if (clientData) {
         try {
           const parsed: any[] = JSON.parse(clientData);
-          // migration locale (phone -> telephone) + sanitization
           const normalized: Client[] = (Array.isArray(parsed) ? parsed : []).map((c: any) => {
             const tel = sanitizePhone(c.telephone || c.phone || '');
             return { ...c, telephone: tel };
           });
           setClients(normalized);
-          setFilteredClients(normalized);
           await AsyncStorage.setItem('clients', JSON.stringify(normalized));
         } catch {
           setClients([]);
-          setFilteredClients([]);
         }
       }
       if (messageData) {
         try { setCustomMessages(JSON.parse(messageData)); } catch {}
       }
-      await syncFromServer(true); // ⬅️ une seule fois au démarrage
+      await syncFromServer(true);
     })();
   }, [syncFromServer]);
 
-  // Filtrage recherche / type
+  // Filtrage + Tri (regroupe tout au même endroit)
   useEffect(() => {
     const lower = searchQuery.toLowerCase();
+
     let result = clients.filter(
       (client) =>
         (client.nom || '').toLowerCase().includes(lower) ||
         (client.prenom || '').toLowerCase().includes(lower) ||
         (client.telephone || '').includes(lower)
     );
+
     if (smsFilter !== 'Tous') {
       result = result.filter((client) =>
         client.messagesEnvoyes?.some((msg) => msg.type === smsFilter)
       );
     }
+
+    // Tri
+    result = [...result].sort((a, b) => {
+      switch (sortMode) {
+        case 'NAME_ASC':
+          return safeName(a).localeCompare(safeName(b), 'fr', { sensitivity: 'base' });
+        case 'NAME_DESC':
+          return safeName(b).localeCompare(safeName(a), 'fr', { sensitivity: 'base' });
+        case 'LAST_SMS_DESC': {
+          const ta = getLastSmsDate(a), tb = getLastSmsDate(b);
+          if (ta === tb) return safeName(a).localeCompare(safeName(b), 'fr', { sensitivity: 'base' });
+          return tb - ta; // récent d'abord
+        }
+        case 'LAST_SMS_ASC': {
+          const ta = getLastSmsDate(a), tb = getLastSmsDate(b);
+          if (ta === tb) return safeName(a).localeCompare(safeName(b), 'fr', { sensitivity: 'base' });
+          return ta - tb; // ancien d'abord
+        }
+        case 'CREATED_DESC': {
+          const ta = safeDate(a.createdAt), tb = safeDate(b.createdAt);
+          if (ta === tb) return safeName(a).localeCompare(safeName(b), 'fr', { sensitivity: 'base' });
+          return tb - ta; // nouveaux d'abord
+        }
+        case 'CREATED_ASC': {
+          const ta = safeDate(a.createdAt), tb = safeDate(b.createdAt);
+          if (ta === tb) return safeName(a).localeCompare(safeName(b), 'fr', { sensitivity: 'base' });
+          return ta - tb; // anciens d'abord
+        }
+        default:
+          return 0;
+      }
+    });
+
     setFilteredClients(result);
-  }, [searchQuery, smsFilter, clients]);
+  }, [searchQuery, smsFilter, clients, sortMode]);
 
   const toggleSelect = (rawPhone: string) => {
     const phone = sanitizePhone(rawPhone);
@@ -405,7 +465,7 @@ export default function ClientListPage() {
     );
   };
 
-  // suppression (DELETE côté serveur) + tombstone local si échec
+  // suppression
   const deleteClient = async (rawPhone: string) => {
     const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est definitive.');
     if (!ok) return;
@@ -417,7 +477,6 @@ export default function ClientListPage() {
     // Optimiste local
     const updated = clients.filter(c => sanitizePhone(c.telephone) !== phone);
     setClients(updated);
-    setFilteredClients(updated);
     setSelectedClients(prev => prev.filter(t => t !== phone));
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
 
@@ -431,7 +490,6 @@ export default function ClientListPage() {
         });
         if (!del.ok) throw new Error(`HTTP ${del.status}`);
       } else {
-        // pas d’ID serveur : pousse une tombstone via upsert minimal
         await fetch(`${API_BASE}/api/clients/upsert`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -446,7 +504,6 @@ export default function ClientListPage() {
     }
   };
 
-  // reset historique — purge serveur si possible + marqueur local anti-retour
   const resetClientHistory = async (rawPhone: string) => {
     const ok = await confirmAsync(
       'Reinitialiser l’historique ?',
@@ -457,20 +514,16 @@ export default function ClientListPage() {
 
     const phone = sanitizePhone(rawPhone);
 
-    // purge locale immédiate
     const updated = clients.map((c) =>
       sanitizePhone(c.telephone) === phone ? { ...c, messagesEnvoyes: [] } : c
     );
     setClients(updated);
-    setFilteredClients(updated);
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
 
-    // marqueur anti-retour
     const resets = await loadHistoryResets();
     resets[phone] = new Date().toISOString();
     await saveHistoryResets(resets);
 
-    // tentative purge serveur
     try {
       const licenceId = await getStableLicenceId();
       if (!licenceId) throw new Error('LICENCE_ID_MISSING');
@@ -526,19 +579,19 @@ export default function ClientListPage() {
     licenceId,
     phoneNumber,
     message,
-    category,                     // ← nouveau
+    category,
   }:{
     licenceId: string;
-    phoneNumber: string;          // attendu 06… côté appelant
+    phoneNumber: string;
     message: string;
-    category?: string;            // Lunettes | Lentilles | SAV | Commande | 'Marketing' | etc.
+    category?: string;
   }) => {
-    const e164 = toE164FR(phoneNumber);       // ✅ normalisation systématique
+    const e164 = toE164FR(phoneNumber);
     const payload: any = {
       licenceId,
-      phoneNumber: e164,                       // ← on envoie E.164 au serveur
+      phoneNumber: e164,
       message,
-      category,                                // ← pour la journalisation/classement
+      category,
     };
 
     const resp = await fetch(SEND_SMS_ENDPOINT, {
@@ -655,7 +708,6 @@ export default function ClientListPage() {
 
       await AsyncStorage.setItem('clients', JSON.stringify(updated));
       setClients(updated);
-      setFilteredClients(updated);
       setSelectedClients([]);
 
       setBatchSummary({ sent, skipped: skippedConsent, failed });
@@ -720,25 +772,81 @@ export default function ClientListPage() {
     </View>
   );
 
-  // ======== NOUVEAU: bouton toujours visible mais inactif si aucune sélection ========
   const selectedCount = selectedClients.length;
   const hasSelection = selectedCount > 0;
 
   return (
     <View style={styles.container}>
-      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+      {/* Barre de titre + Sync */}
+      <View style={styles.headerRow}>
         <Text style={styles.title}>Mes Clients</Text>
         <TouchableOpacity onPress={() => syncFromServer(true)} style={styles.syncBtn} disabled={syncing}>
           <Text style={styles.syncBtnText}>{syncing ? '…' : '↻ Sync'}</Text>
         </TouchableOpacity>
       </View>
-
       {syncError ? <Text style={styles.syncError}>⚠ {syncError}</Text> : null}
 
       <TouchableOpacity style={styles.homeButton} onPress={() => navigation.navigate('Home')}>
         <Text style={styles.homeButtonText}>← Accueil</Text>
       </TouchableOpacity>
 
+      {/* NOUVEAU : Barre d’actions en haut avec le bouton d’envoi */}
+      <View style={styles.topActionBar}>
+        {/* Contrôles de tri */}
+        <View style={styles.sortRow}>
+          <Text style={styles.sortLabel}>Trier :</Text>
+          <TouchableOpacity
+            style={[styles.sortChip, sortMode === 'NAME_ASC' && styles.sortChipActive]}
+            onPress={() => setSortMode('NAME_ASC')}
+          >
+            <Text style={styles.sortChipText}>A → Z</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.sortChip, sortMode === 'NAME_DESC' && styles.sortChipActive]}
+            onPress={() => setSortMode('NAME_DESC')}
+          >
+            <Text style={styles.sortChipText}>Z → A</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.sortChip, sortMode === 'LAST_SMS_DESC' && styles.sortChipActive]}
+            onPress={() => setSortMode('LAST_SMS_DESC')}
+          >
+            <Text style={styles.sortChipText}>Dernier SMS</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.sortChip, sortMode === 'LAST_SMS_ASC' && styles.sortChipActive]}
+            onPress={() => setSortMode('LAST_SMS_ASC')}
+          >
+            <Text style={styles.sortChipText}>Premier SMS</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.sortChip, sortMode === 'CREATED_DESC' && styles.sortChipActive]}
+            onPress={() => setSortMode('CREATED_DESC')}
+          >
+            <Text style={styles.sortChipText}>Récents</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.sortChip, sortMode === 'CREATED_ASC' && styles.sortChipActive]}
+            onPress={() => setSortMode('CREATED_ASC')}
+          >
+            <Text style={styles.sortChipText}>Anciens</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Bouton d’envoi en haut à droite */}
+        <TouchableOpacity
+          style={[styles.smsButtonTop, !hasSelection && styles.smsButtonDisabled]}
+          onPress={openSmsDialog}
+          disabled={!hasSelection}
+          accessibilityState={{ disabled: !hasSelection }}
+        >
+          <Text style={styles.smsText}>
+            Envoyer SMS{hasSelection ? ` (${selectedCount})` : ''}
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Recherche + Filtres */}
       <TextInput
         style={styles.searchInput}
         placeholder="Rechercher un client..."
@@ -767,20 +875,6 @@ export default function ClientListPage() {
         renderItem={renderItem}
       />
 
-      {/* Bouton toujours visible, grisé quand aucun client sélectionné */}
-      <View style={{ marginTop: 14 }}>
-        <TouchableOpacity
-          style={[styles.smsButton, !hasSelection && styles.smsButtonDisabled]}
-          onPress={openSmsDialog}
-          disabled={!hasSelection}
-          accessibilityState={{ disabled: !hasSelection }}
-        >
-          <Text style={styles.smsText}>
-            Envoyer SMS{hasSelection ? ` (${selectedCount})` : ''}
-          </Text>
-        </TouchableOpacity>
-      </View>
-
       {/* Modale type */}
       <Modal visible={typeModalVisible} transparent animationType="fade" onRequestClose={() => setTypeModalVisible(false)}>
         <View style={styles.customOverlay}>
@@ -795,7 +889,7 @@ export default function ClientListPage() {
               style={[styles.typeBtn, { backgroundColor: '#555' }]}
               onPress={() => { setTypeModalVisible(false); setCustomModalVisible(true); }}
             >
-              <Text style={styles.customBtnText}>Personnalise</Text>
+              <Text style={styles.customBtnText}>Personnalisé</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.typeBtn, { backgroundColor: '#3b0d0d' }]}
@@ -807,11 +901,11 @@ export default function ClientListPage() {
         </View>
       </Modal>
 
-      {/* Modale “Personnalise” */}
+      {/* Modale “Personnalisé” */}
       <Modal visible={customModalVisible} transparent animationType="fade" onRequestClose={() => setCustomModalVisible(false)}>
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
-            <Text style={styles.customTitle}>Message personnalise</Text>
+            <Text style={styles.customTitle}>Message personnalisé</Text>
             <Text style={styles.customHint}>Placeholders : {'{prenom}'} et {'{nom}'}</Text>
             <TextInput
               style={styles.customInput}
@@ -851,10 +945,10 @@ export default function ClientListPage() {
               <Text style={[styles.progressLine, { marginTop: 8 }]}>{progressCount} / {progressTotal}</Text>
               {sendStep === 'done' && batchSummary && (
                 <View style={{ marginTop: 8 }}>
-                  <Text style={styles.progressOk}>✓ Termine</Text>
-                  <Text style={styles.progressLine}>Envoyes : {batchSummary.sent}</Text>
-                  <Text style={styles.progressLine}>Ignores (consentement/tel) : {batchSummary.skipped}</Text>
-                  <Text style={styles.progressLine}>Echecs : {batchSummary.failed}</Text>
+                  <Text style={styles.progressOk}>✓ Terminé</Text>
+                  <Text style={styles.progressLine}>Envoyés : {batchSummary.sent}</Text>
+                  <Text style={styles.progressLine}>Ignorés (consentement/tel) : {batchSummary.skipped}</Text>
+                  <Text style={styles.progressLine}>Échecs : {batchSummary.failed}</Text>
                 </View>
               )}
               {sendStep === 'error' && <Text style={styles.progressErr}>✗ {sendError || 'Erreur inconnue'}</Text>}
@@ -868,15 +962,38 @@ export default function ClientListPage() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, padding: 20, backgroundColor: '#000' },
+
+  headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   title: { fontSize: 22, fontWeight: 'bold', color: '#fff', marginBottom: 8 },
-  homeButton: { alignSelf: 'flex-start', paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#1a1a1a', borderRadius: 6, marginBottom: 12 },
+  homeButton: { alignSelf: 'flex-start', paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#1a1a1a', borderRadius: 6, marginBottom: 12, marginTop: 8 },
   homeButtonText: { fontSize: 14, color: '#00BFFF' },
+
+  // Top bar (tri + bouton envoyer)
+  topActionBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    marginBottom: 12,
+    flexWrap: 'wrap',
+  },
+  sortRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6, flex: 1 },
+  sortLabel: { color: '#ddd', marginRight: 6 },
+  sortChip: { backgroundColor: '#1f2937', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 999 },
+  sortChipActive: { backgroundColor: '#00BFFF' },
+  sortChipText: { color: '#fff', fontWeight: '600', fontSize: 12 },
+
+  smsButtonTop: { backgroundColor: '#00BFFF', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 10, alignItems: 'center' },
+  smsButtonDisabled: { backgroundColor: '#3a3a3a', opacity: 0.6 },
+  smsText: { color: '#fff', fontWeight: 'bold', fontSize: 15 },
+
   searchInput: { backgroundColor: '#1a1a1a', padding: 10, marginBottom: 12, borderRadius: 8, color: '#fff' },
   filterRow: { flexDirection: 'row', marginBottom: 12, flexWrap: 'wrap', gap: 6 },
   filterButton: { paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6, backgroundColor: '#222', marginRight: 8, marginBottom: 6 },
   filterButtonActive: { backgroundColor: '#00BFFF' },
   filterText: { color: '#ccc' },
   filterTextActive: { color: '#fff', fontWeight: 'bold' },
+
   clientItem: { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#333' },
   clientRow: { flexDirection: 'row', alignItems: 'center' },
   clientText: { fontSize: 16, color: '#fff' },
@@ -886,9 +1003,6 @@ const styles = StyleSheet.create({
   deleteBtnText: { fontSize: 14, color: '#ff6b6b', fontWeight: '700' },
   smsHistory: { marginTop: 4, paddingLeft: 10 },
   smsHistoryText: { fontSize: 13, color: '#aaa' },
-  smsButton: { backgroundColor: '#00BFFF', padding: 14, borderRadius: 10, alignItems: 'center' },
-  smsButtonDisabled: { backgroundColor: '#3a3a3a', opacity: 0.6 }, // ← ajouté pour l’état grisé
-  smsText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
 
   // Sync
   syncBtn: { paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#1f2937', borderRadius: 6 },
