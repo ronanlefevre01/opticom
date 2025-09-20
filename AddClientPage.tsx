@@ -28,18 +28,14 @@ const toE164FR = (raw: string): string => {
 };
 const isPhone10 = (p: string) => /^\d{10}$/.test(p);
 
-/** strict: retourne vrai si le numéro `p` correspond réellement à la saisie `q` */
+/** strict: vrai si le numéro `p` correspond réellement à la saisie `q` */
 const phoneMatches = (p: string, q: string) => {
   const sp = sanitizePhone(p);
   const sq = sanitizePhone(q);
   if (!sq) return false;
-  // tant qu'on a moins de 6 chiffres, on ne “suggère” pas
   if (sq.length < 6) return false;
-  // à partir de 6 chiffres saisis: il faut que le début du numéro stocké corresponde
   if (sp.startsWith(sq)) return true;
-  // et on accepte l'entrée si l'utilisateur a tapé plus que le stocké (cas rare)
   if (sq.startsWith(sp) && sp.length >= 6) return true;
-  // variante E.164 (sécurité)
   return toE164FR(sp).startsWith(toE164FR(sq));
 };
 
@@ -69,7 +65,7 @@ const appendSignature = (msg: string, sig: string) => {
   const s = (sig || '').trim();
   if (!s) return m;
   const norm = (x: string) => x.replace(/\s+/g, ' ').trim().toLowerCase();
-  if (norm(m).endsWith(norm(s))) return m; // évite doublons
+  if (norm(m).endsWith(norm(s))) return m;
   const needsSpace = /[.!?]\s*$/.test(m);
   const sep = needsSpace ? ' ' : ' — ';
   return `${m}${sep}${s}`;
@@ -203,12 +199,49 @@ export default function AddClientPage() {
   const [sendError, setSendError] = useState<string | null>(null);
 
   // ========= SUGGESTIONS (anti-doublon par téléphone) =========
-  type LightClient = { id?: string; prenom?: string; nom?: string; phone?: string; telephone?: string; email?: string; lunettes?: boolean; lentilles?: any[]; dateNaissance?: string; };
+  type LightClient = {
+    id?: string; prenom?: string; nom?: string; phone?: string; telephone?: string; email?: string;
+    lunettes?: boolean; lentilles?: any[]; dateNaissance?: string; consent?: any; consentementMarketing?: boolean;
+  };
   const [suggestions, setSuggestions] = useState<LightClient[]>([]);
   const [loadingSug, setLoadingSug] = useState(false);
   const [showSug, setShowSug] = useState(false);
   const debounceRef = useRef<any>(null);
   const [selectedExistingId, setSelectedExistingId] = useState<string | null>(null);
+
+  /** Récupération par ID (essaie plusieurs routes), sinon repli */
+  const fetchClientById = useCallback(async (id: string): Promise<LightClient | null> => {
+    const lic = licenceIdRef.current || await getStableLicenceId();
+    licenceIdRef.current = lic;
+    if (!lic || !id) return null;
+
+    const tryParse = (j: any): any => j?.client || j?.data || j;
+    const urls = [
+      `${SERVER_BASE}/api/clients/by-id?licenceId=${encodeURIComponent(lic)}&id=${encodeURIComponent(id)}`,
+      `${SERVER_BASE}/api/clients/get?id=${encodeURIComponent(id)}&licenceId=${encodeURIComponent(lic)}`,
+      `${SERVER_BASE}/api/clients/${encodeURIComponent(id)}?licenceId=${encodeURIComponent(lic)}`,
+    ];
+    for (const url of urls) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) continue;
+        const j = await r.json().catch(() => ({}));
+        const obj = tryParse(j);
+        if (obj && typeof obj === 'object') {
+          const phone = sanitizePhone(obj.phone || obj.telephone || '');
+          return { ...obj, phone };
+        }
+      } catch {}
+    }
+    // repli local
+    try {
+      const raw = await AsyncStorage.getItem('clients');
+      const local: any[] = raw ? JSON.parse(raw) : [];
+      const found = (local || []).find((c) => String(c.id) === String(id));
+      if (found) return { ...found, phone: sanitizePhone(found.phone || found.telephone || '') };
+    } catch {}
+    return null;
+  }, []);
 
   /** Recherche robuste côté serveur avec repli local + FILTRE STRICT Téléphone */
   const searchClientsRemote = useCallback(async (q: string): Promise<LightClient[]> => {
@@ -235,7 +268,6 @@ export default function AddClientPage() {
       `${SERVER_BASE}/api/clients?licenceId=${encodeURIComponent(lic)}&q=${encodeURIComponent(clean)}`,
     ];
 
-    // 1) Essais de routes ciblées
     for (const url of urls) {
       try {
         const r = await fetch(url);
@@ -246,7 +278,6 @@ export default function AddClientPage() {
       } catch {}
     }
 
-    // 2) Repli : récupérer la liste et filtrer côté client
     try {
       const r = await fetch(`${SERVER_BASE}/api/clients?licenceId=${encodeURIComponent(lic)}`);
       if (r.ok) {
@@ -256,12 +287,11 @@ export default function AddClientPage() {
       }
     } catch {}
 
-    // 3) Repli ultime : cache local
     try {
       const data = await AsyncStorage.getItem('clients');
       const local: any[] = data ? JSON.parse(data) : [];
       return (local || [])
-        .map(normalize)
+        .map((c) => ({ ...c, phone: sanitizePhone(c.phone || c.telephone || '') }))
         .filter((c) => phoneMatches(c.phone, clean));
     } catch { return []; }
   }, []);
@@ -273,7 +303,6 @@ export default function AddClientPage() {
 
     if (debounceRef.current) clearTimeout(debounceRef.current);
 
-    // n’ouvre PAS la liste avant 6 chiffres saisis
     if (clean.length < 6) {
       setSuggestions([]);
       setShowSug(false);
@@ -289,47 +318,62 @@ export default function AddClientPage() {
     }, 220);
   }, [searchClientsRemote]);
 
-  const selectSuggestion = useCallback((c: LightClient) => {
-    const phone = sanitizePhone((c.phone as any) || (c.telephone as any) || telephone);
+  /** Remplit tous les champs depuis un objet "complet" */
+  const hydrateFrom = useCallback((c: any) => {
+    const phone = sanitizePhone(c.phone || c.telephone || telephone);
     setSelectedExistingId(String(c.id || ''));
     setTelephone(phone);
     setNom(String(c.nom || ''));
     setPrenom(String(c.prenom || ''));
-    setEmail(String((c as any).email || ''));
+    setEmail(String(c.email || ''));
+
+    // produits / lentilles
     setLunettes(!!c.lunettes);
-    const arr: string[] = Array.isArray(c.lentilles) ? (c.lentilles as any) : [];
+    const arr: string[] = Array.isArray(c.lentilles) ? c.lentilles : [];
     setJourn30(arr.includes('30j'));
     setJourn60(arr.includes('60j'));
     setJourn90(arr.includes('90j'));
     setMens6(arr.includes('6mois'));
     setMens12(arr.includes('1an'));
-    const dn = String((c as any).dateNaissance || '');
+
+    // consentements
+    const svc = !!c?.consent?.service_sms?.value;
+    const mkt = !!c?.consent?.marketing_sms?.value || !!c.consentementMarketing;
+    setConsentService(svc);
+    setConsentMarketing(mkt);
+
+    // date naissance
+    const dn = String(c.dateNaissance || c.naissance || '');
     const mt = dn.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
     if (mt) { setBDay(mt[1].padStart(2,'0')); setBMonth(mt[2].padStart(2,'0')); setBYear(mt[3]); }
-    setShowSug(false);
+    else { setBDay(''); setBMonth(''); setBYear(''); }
   }, [telephone]);
+
+  /** AU CLIC : va chercher le dossier complet par ID, sinon prend la suggestion, puis hydrate les champs */
+  const selectSuggestion = useCallback(async (c: LightClient) => {
+    setShowSug(false);
+    const id = String(c.id || '');
+    let full: any = null;
+
+    if (id) {
+      full = await fetchClientById(id);
+    }
+    if (!full) full = c;
+
+    hydrateFrom(full);
+
+    // petit toast d’info
+    setToast({ visible: true, text: '📂 Dossier chargé' });
+    setTimeout(() => setToast({ visible: false, text: '' }), 1200);
+  }, [fetchClientById, hydrateFrom]);
 
   // Pré-remplissage + chargement modèles
   useEffect(() => {
     if (mode === 'edit' && client) {
-      const c: any = client;
-      setSelectedExistingId(String(c.id || '') || null);
-      setNom(String(c.nom || ''));
-      setPrenom(String(c.prenom || ''));
-      setTelephone(String(c.telephone || ''));
-      setEmail(String(c.email || ''));
-      const dn = String(c.dateNaissance || '');
-      const mt = dn.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
-      if (mt) { setBDay(mt[1].padStart(2, '0')); setBMonth(mt[2].padStart(2, '0')); setBYear(mt[3]); } else { setBDay(''); setBMonth(''); setBYear(''); }
-      setLunettes(!!c.lunettes);
-      const arr: string[] = Array.isArray(c.lentilles) ? c.lentilles : [];
-      setJourn30(arr.includes('30j')); setJourn60(arr.includes('60j')); setJourn90(arr.includes('90j'));
-      setMens6(arr.includes('6mois')); setMens12(arr.includes('1an'));
-      setConsentService(!!c?.consent?.service_sms?.value);
-      setConsentMarketing(!!c?.consent?.marketing_sms?.value || !!c.consentementMarketing);
+      hydrateFrom(client as any);
     }
     AsyncStorage.getItem('messages').then((data) => { if (!data) return; try { setMessages(JSON.parse(data)); } catch {} });
-  }, [mode, client]);
+  }, [mode, client, hydrateFrom]);
 
   const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>) => setter(prev => !prev);
 
@@ -549,7 +593,7 @@ export default function AddClientPage() {
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.label}>Téléphone *</Text>
-      <View style={{ position: 'relative', zIndex: 50 /* au-dessus du bouton */ }}>
+      <View style={{ position: 'relative', zIndex: 50 }}>
         <TextInput
           style={styles.input}
           keyboardType={Platform.OS === 'web' ? 'text' : 'phone-pad'}
@@ -583,7 +627,6 @@ export default function AddClientPage() {
                 );
               })}
 
-              {/* Option : créer un nouveau dossier avec ce numéro (même famille) */}
               {isPhone10(telephone) && suggestions.some(s => sanitizePhone((s.phone as any) || (s.telephone as any)) === telephone) && (
                 <TouchableOpacity
                   style={[styles.sugItem, { backgroundColor: '#0f172a' }]}
@@ -679,8 +722,7 @@ export default function AddClientPage() {
         <Text style={styles.homeButtonText}>🏠 Retour à l’accueil</Text>
       </TouchableOpacity>
 
-      {/* Modales (SMS / Custom / Date) et Progress, Toast — inchangés */}
-      {/* --- SMS type --- */}
+      {/* Modales SMS / Custom / Date + Progress + Toast (inchangés sauf styles) */}
       <Modal visible={showSMSModal} transparent animationType="fade" onRequestClose={() => setShowSMSModal(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
@@ -712,7 +754,6 @@ export default function AddClientPage() {
         </View>
       </Modal>
 
-      {/* --- SMS personnalisé --- */}
       <Modal visible={showCustomModal} transparent animationType="fade" onRequestClose={() => setShowCustomModal(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
@@ -738,7 +779,6 @@ export default function AddClientPage() {
         </View>
       </Modal>
 
-      {/* --- Sélecteurs JJ/MM/AAAA --- */}
       <Modal visible={pickerOpen !== null} transparent animationType="fade" onRequestClose={() => setPickerOpen(null)}>
         <View style={styles.modalOverlay}>
           <View style={styles.pickerCard}>
@@ -746,7 +786,7 @@ export default function AddClientPage() {
               {pickerOpen === 'day' ? 'Sélectionner le jour' : pickerOpen === 'month' ? 'Sélectionner le mois' : 'Sélectionner l’année'}
             </Text>
             <ScrollView style={{ maxHeight: 300, alignSelf: 'stretch' }}>
-              {(pickerOpen === 'day' ? dayOptions : pickerOpen === 'month' ? monthOptions : yearOptions).map((opt: any) => (
+              {pickerList.map((opt: any) => (
                 <TouchableOpacity
                   key={opt.value}
                   style={styles.pickerItem}
@@ -768,7 +808,6 @@ export default function AddClientPage() {
         </View>
       </Modal>
 
-      {/* --- Progress envoi SMS --- */}
       <Modal visible={sending} transparent animationType="fade" onRequestClose={() => { if (sendStep !== 'send') setSending(false); }}>
         <View style={styles.modalOverlay}>
           <View style={styles.progressCard}>
@@ -794,7 +833,6 @@ export default function AddClientPage() {
         </View>
       </Modal>
 
-      {/* --- Toast --- */}
       {toast.visible && (
         <View style={styles.toast}>
           <Text style={styles.toastText}>{toast.text}</Text>
@@ -817,7 +855,7 @@ const styles = StyleSheet.create({
     padding: 10, marginTop: 4, color: '#fff', backgroundColor: '#111',
   },
 
-  // SUGGESTIONS (zIndex + hauteur max + scroll)
+  // SUGGESTIONS
   sugPanel: {
     position: 'absolute',
     top: 52,
