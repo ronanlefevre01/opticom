@@ -19,6 +19,13 @@ const sanitizePhone = (raw: string): string => {
   if (p.startsWith('+33')) p = '0' + p.slice(3);
   return p.replace(/\D/g, '');
 };
+const toE164FR = (raw: string): string => {
+  const p = sanitizePhone(raw);
+  if (/^0\d{9}$/.test(p)) return '+33' + p.slice(1);
+  if (/^33\d{9}$/.test(p)) return '+' + p;
+  if (p.startsWith('+33')) return p;
+  return p;
+};
 const isPhone10 = (p: string) => /^\d{10}$/.test(p);
 
 const DEFAULT_TEMPLATES: Record<'Lunettes' | 'SAV' | 'Lentilles' | 'Commande', string> = {
@@ -39,9 +46,7 @@ const getSignatureFromSettings = async (): Promise<string> => {
     }
     const localSig = await AsyncStorage.getItem('signature');
     return (localSig || '').trim();
-  } catch {
-    return '';
-  }
+  } catch { return ''; }
 };
 
 const appendSignature = (msg: string, sig: string) => {
@@ -49,7 +54,7 @@ const appendSignature = (msg: string, sig: string) => {
   const s = (sig || '').trim();
   if (!s) return m;
   const norm = (x: string) => x.replace(/\s+/g, ' ').trim().toLowerCase();
-  if (norm(m).endsWith(norm(s))) return m;
+  if (norm(m).endsWith(norm(s))) return m; // évite doublons
   const needsSpace = /[.!?]\s*$/.test(m);
   const sep = needsSpace ? ' ' : ' — ';
   return `${m}${sep}${s}`;
@@ -190,58 +195,81 @@ export default function AddClientPage() {
   const debounceRef = useRef<any>(null);
   const [selectedExistingId, setSelectedExistingId] = useState<string | null>(null);
 
-  // Recherche côté serveur (by-phone prioritaire) puis /search en secours
+  /** Recherche robuste côté serveur avec repli local */
   const searchClientsRemote = useCallback(async (q: string): Promise<LightClient[]> => {
     const lic = licenceIdRef.current || await getStableLicenceId();
     licenceIdRef.current = lic;
     if (!lic) return [];
 
+    const clean = sanitizePhone(q);
+    const e164 = toE164FR(clean);
+
+    const tryParse = (j: any): LightClient[] => {
+      if (Array.isArray(j)) return j as any[];
+      if (Array.isArray(j?.clients)) return j.clients as any[];
+      if (Array.isArray(j?.items)) return j.items as any[];
+      if (Array.isArray(j?.data)) return j.data as any[];
+      return [];
+    };
+
     const urls = [
-      `${SERVER_BASE}/api/clients/by-phone?licenceId=${encodeURIComponent(lic)}&phone=${encodeURIComponent(q)}`,
-      `${SERVER_BASE}/api/clients/search?licenceId=${encodeURIComponent(lic)}&q=${encodeURIComponent(q)}`,
+      `${SERVER_BASE}/api/clients/by-phone?licenceId=${encodeURIComponent(lic)}&phone=${encodeURIComponent(clean)}`,
+      `${SERVER_BASE}/api/clients/search?licenceId=${encodeURIComponent(lic)}&q=${encodeURIComponent(clean)}`,
+      `${SERVER_BASE}/api/clients?licenceId=${encodeURIComponent(lic)}&q=${encodeURIComponent(clean)}`,
     ];
 
+    // 1) Essais de routes ciblées
     for (const url of urls) {
       try {
         const r = await fetch(url);
         if (!r.ok) continue;
         const j = await r.json().catch(() => ({}));
-        const items: any[] =
-          Array.isArray(j) ? j :
-          Array.isArray(j.clients) ? j.clients :
-          Array.isArray(j.items) ? j.items : [];
-        if (items.length) return items as any[];
+        const arr = tryParse(j);
+        if (arr.length) return arr;
       } catch {}
     }
-    return [];
+
+    // 2) Repli : récupérer la liste et filtrer côté client
+    try {
+      const r = await fetch(`${SERVER_BASE}/api/clients?licenceId=${encodeURIComponent(lic)}`);
+      if (r.ok) {
+        const j = await r.json().catch(() => ({}));
+        const arr = tryParse(j);
+        const out = (arr || []).filter((c: any) => {
+          const p = sanitizePhone(c.phone || c.telephone || '');
+          return p.startsWith(clean) || toE164FR(p).startsWith(e164);
+        });
+        if (out.length) return out;
+      }
+    } catch {}
+
+    // 3) Dernier repli : cache local
+    try {
+      const data = await AsyncStorage.getItem('clients');
+      const local: any[] = data ? JSON.parse(data) : [];
+      return (local || []).filter((c: any) => {
+        const p = sanitizePhone(c.telephone || c.phone || '');
+        return p.startsWith(clean);
+      });
+    } catch { return []; }
   }, []);
 
-  // Saisie téléphone → suggestions strictes (startsWith), dédoublonnées
   const handlePhoneChange = useCallback((val: string) => {
     const clean = sanitizePhone(val);
     setTelephone(clean);
     setSelectedExistingId(null);
 
     if (debounceRef.current) clearTimeout(debounceRef.current);
-
     if (clean.length < 6) {
       setSuggestions([]);
       setShowSug(false);
       return;
     }
-
     debounceRef.current = setTimeout(async () => {
       setLoadingSug(true);
-      const raw = await searchClientsRemote(clean);
-
-      const seen = new Set<string>();
-      const filtered = (raw || [])
-        .map((c: any) => ({ ...c, phone: sanitizePhone(c.phone || c.telephone || '') }))
-        .filter((c: any) => c.phone && c.phone.startsWith(clean))
-        .filter((c: any) => { const k = c.phone; if (seen.has(k)) return false; seen.add(k); return true; })
-        .slice(0, 8);
-
-      setSuggestions(filtered);
+      const res = await searchClientsRemote(clean);
+      const out = (res || []).map((c: any) => ({ ...c, phone: sanitizePhone(c.phone || c.telephone || '') }));
+      setSuggestions(out);
       setShowSug(true);
       setLoadingSug(false);
     }, 220);
@@ -267,7 +295,7 @@ export default function AddClientPage() {
     setShowSug(false);
   }, [telephone]);
 
-  // Pré-remplissage + modèles
+  // Pré-remplissage + chargement modèles
   useEffect(() => {
     if (mode === 'edit' && client) {
       const c: any = client;
@@ -316,6 +344,7 @@ export default function AddClientPage() {
       updatedAt: now,
     };
 
+    // 1) Sauvegarde locale
     try {
       const data = await AsyncStorage.getItem('clients');
       let clients: any[] = data ? JSON.parse(data) : [];
@@ -337,6 +366,7 @@ export default function AddClientPage() {
       return showToast('❌ Échec sauvegarde locale');
     }
 
+    // 2) Push serveur
     try {
       const licenceId = licenceIdRef.current || await getStableLicenceId();
       licenceIdRef.current = licenceId;
@@ -505,7 +535,7 @@ export default function AddClientPage() {
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.label}>Téléphone *</Text>
-      <View style={styles.phoneWrap}>
+      <View style={{ position: 'relative', zIndex: 20 /* au-dessus du bouton */ }}>
         <TextInput
           style={styles.input}
           keyboardType={Platform.OS === 'web' ? 'text' : 'phone-pad'}
@@ -522,33 +552,31 @@ export default function AddClientPage() {
               <Text style={styles.sugHint}>Aucun dossier trouvé</Text>
             )}
 
-            <ScrollView style={{ maxHeight: 240 }}>
-              {suggestions.map((c, idx) => {
-                const p = sanitizePhone((c.phone as any) || (c.telephone as any) || '');
-                return (
-                  <TouchableOpacity
-                    key={(c as any).id || p || idx}
-                    style={styles.sugItem}
-                    onPress={() => selectSuggestion(c)}
-                  >
-                    <Text style={styles.sugItemTitle}>
-                      {(c.prenom || '').toString()} {(c.nom || '').toString()}
-                    </Text>
-                    <Text style={styles.sugItemSub}>{p || '—'}</Text>
-                  </TouchableOpacity>
-                );
-              })}
-
-              {isPhone10(telephone) && suggestions.some(s => sanitizePhone((s.phone as any) || (s.telephone as any)) === telephone) && (
+            {suggestions.slice(0, 6).map((c, idx) => {
+              const p = sanitizePhone((c.phone as any) || (c.telephone as any) || '');
+              return (
                 <TouchableOpacity
-                  style={[styles.sugItem, { backgroundColor: '#0f172a' }]}
-                  onPress={() => { setSelectedExistingId(null); setShowSug(false); }}
+                  key={(c as any).id || p || idx}
+                  style={styles.sugItem}
+                  onPress={() => selectSuggestion(c)}
                 >
-                  <Text style={[styles.sugItemTitle, { color: '#93c5fd' }]}>Créer un nouveau dossier avec ce numéro</Text>
-                  <Text style={styles.sugItemSub}>Ex : enfant / parent de la même famille</Text>
+                  <Text style={styles.sugItemTitle}>
+                    {(c.prenom || '').toString()} {(c.nom || '').toString()}
+                  </Text>
+                  <Text style={styles.sugItemSub}>{p || '—'}</Text>
                 </TouchableOpacity>
-              )}
-            </ScrollView>
+              );
+            })}
+
+            {isPhone10(telephone) && suggestions.some(s => sanitizePhone((s.phone as any) || (s.telephone as any)) === telephone) && (
+              <TouchableOpacity
+                style={[styles.sugItem, { backgroundColor: '#0f172a' }]}
+                onPress={() => { setSelectedExistingId(null); setShowSug(false); }}
+              >
+                <Text style={[styles.sugItemTitle, { color: '#93c5fd' }]}>Créer un nouveau dossier avec ce numéro</Text>
+                <Text style={styles.sugItemSub}>Ex : enfant / parent de la même famille</Text>
+              </TouchableOpacity>
+            )}
 
             <TouchableOpacity style={styles.sugClose} onPress={() => setShowSug(false)}>
               <Text style={{ color: '#9ca3af', fontWeight: '600' }}>Fermer</Text>
@@ -778,35 +806,33 @@ const styles = StyleSheet.create({
     padding: 10, marginTop: 4, color: '#fff', backgroundColor: '#111',
   },
 
-  // Le conteneur du champ téléphone garde le panneau au-dessus des éléments suivants
-  phoneWrap: {
-    position: 'relative',
-    zIndex: 100, // > bouton
-  },
-
-  // SUGGESTIONS
+  // SUGGESTIONS (zIndex élevé pour passer devant le bouton)
   sugPanel: {
     position: 'absolute',
     top: 52,
     left: 0,
     right: 0,
-    backgroundColor: '#0b1220',
+    backgroundColor: '#111827',
     borderWidth: 1,
-    borderColor: '#1f2937',
+    borderColor: '#374151',
     borderRadius: 10,
-    paddingVertical: 6,
-    zIndex: 9999,     // priorité maximum (web/iOS)
-    elevation: 50,    // priorité Android
-    shadowColor: '#000',
-    shadowOpacity: 0.35,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 8 },
+    paddingVertical: 8,
+    zIndex: 50,
   },
   sugHint: { color: '#9ca3af', textAlign: 'center', paddingVertical: 8 },
-  sugItem: { paddingVertical: 10, paddingHorizontal: 12, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#243143' },
+  sugItem: { paddingVertical: 10, paddingHorizontal: 12, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#374151' },
   sugItemTitle: { color: '#e5e7eb', fontWeight: '700' },
-  sugItemSub: { color: '#9ca3af', marginTop: 2, fontVariant: ['tabular-nums'] },
-  sugClose: { alignSelf: 'center', marginTop: 6, marginBottom: 6, paddingVertical: 6, paddingHorizontal: 12, borderRadius: 8, backgroundColor: '#111827' },
+  sugItemSub: { color: '#9ca3af', marginTop: 2 },
+  sugClose: {
+    alignSelf: 'center',
+    marginTop: 6,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    backgroundColor: '#0b0b0b',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#333'
+  },
 
   // Date of birth selects
   dobRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6 },
@@ -824,13 +850,11 @@ const styles = StyleSheet.create({
 
   button: {
     marginTop: 24, backgroundColor: '#007AFF', padding: 14,
-    borderRadius: 10, alignItems: 'center',
+    borderRadius: 10, alignItems: 'center', zIndex: 0,
   },
   smsButton: {
     marginTop: 12, backgroundColor: '#28a745', padding: 14,
     borderRadius: 10, alignItems: 'center',
-    position: 'relative',
-    zIndex: 1, // plus bas que phoneWrap/sugPanel
   },
   buttonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
 
