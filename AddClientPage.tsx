@@ -49,7 +49,7 @@ const appendSignature = (msg: string, sig: string) => {
   const s = (sig || '').trim();
   if (!s) return m;
   const norm = (x: string) => x.replace(/\s+/g, ' ').trim().toLowerCase();
-  if (norm(m).endsWith(norm(s))) return m; // évite doublons de signature
+  if (norm(m).endsWith(norm(s))) return m;
   const needsSpace = /[.!?]\s*$/.test(m);
   const sep = needsSpace ? ' ' : ' — ';
   return `${m}${sep}${s}`;
@@ -234,7 +234,6 @@ export default function AddClientPage() {
       setLoadingSug(true);
       const raw = await searchClientsRemote(clean);
 
-      // normalisation + startsWith + dédoublonnage par numéro
       const seen = new Set<string>();
       const filtered = (raw || [])
         .map((c: any) => ({ ...c, phone: sanitizePhone(c.phone || c.telephone || '') }))
@@ -255,7 +254,6 @@ export default function AddClientPage() {
     setNom(String(c.nom || ''));
     setPrenom(String(c.prenom || ''));
     setEmail(String((c as any).email || ''));
-    // produits si dispo
     setLunettes(!!c.lunettes);
     const arr: string[] = Array.isArray(c.lentilles) ? (c.lentilles as any) : [];
     setJourn30(arr.includes('30j'));
@@ -263,14 +261,13 @@ export default function AddClientPage() {
     setJourn90(arr.includes('90j'));
     setMens6(arr.includes('6mois'));
     setMens12(arr.includes('1an'));
-    // date naissance
     const dn = String((c as any).dateNaissance || '');
     const mt = dn.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
     if (mt) { setBDay(mt[1].padStart(2,'0')); setBMonth(mt[2].padStart(2,'0')); setBYear(mt[3]); }
     setShowSug(false);
   }, [telephone]);
 
-  // Pré-remplissage en mode édition + chargement modèles
+  // Pré-remplissage + modèles
   useEffect(() => {
     if (mode === 'edit' && client) {
       const c: any = client;
@@ -304,7 +301,7 @@ export default function AddClientPage() {
     const now = new Date().toISOString();
 
     const localClient: any = {
-      id: selectedExistingId || (client as any)?.id, // ← si suggestion choisie, on met à jour l’existant
+      id: selectedExistingId || (client as any)?.id,
       nom, prenom, telephone: tel, email,
       dateNaissance,
       lunettes,
@@ -319,7 +316,6 @@ export default function AddClientPage() {
       updatedAt: now,
     };
 
-    // 1) Sauvegarde locale
     try {
       const data = await AsyncStorage.getItem('clients');
       let clients: any[] = data ? JSON.parse(data) : [];
@@ -341,7 +337,6 @@ export default function AddClientPage() {
       return showToast('❌ Échec sauvegarde locale');
     }
 
-    // 2) Push serveur
     try {
       const licenceId = licenceIdRef.current || await getStableLicenceId();
       licenceIdRef.current = licenceId;
@@ -510,7 +505,7 @@ export default function AddClientPage() {
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.label}>Téléphone *</Text>
-      <View style={{ position: 'relative' }}>
+      <View style={styles.phoneWrap}>
         <TextInput
           style={styles.input}
           keyboardType={Platform.OS === 'web' ? 'text' : 'phone-pad'}
@@ -544,7 +539,6 @@ export default function AddClientPage() {
                 );
               })}
 
-              {/* Option : créer un nouveau dossier avec ce numéro (même famille) */}
               {isPhone10(telephone) && suggestions.some(s => sanitizePhone((s.phone as any) || (s.telephone as any)) === telephone) && (
                 <TouchableOpacity
                   style={[styles.sugItem, { backgroundColor: '#0f172a' }]}
@@ -784,6 +778,12 @@ const styles = StyleSheet.create({
     padding: 10, marginTop: 4, color: '#fff', backgroundColor: '#111',
   },
 
+  // Le conteneur du champ téléphone garde le panneau au-dessus des éléments suivants
+  phoneWrap: {
+    position: 'relative',
+    zIndex: 100, // > bouton
+  },
+
   // SUGGESTIONS
   sugPanel: {
     position: 'absolute',
@@ -795,13 +795,12 @@ const styles = StyleSheet.create({
     borderColor: '#1f2937',
     borderRadius: 10,
     paddingVertical: 6,
-    zIndex: 100,
-    // ombre
+    zIndex: 9999,     // priorité maximum (web/iOS)
+    elevation: 50,    // priorité Android
     shadowColor: '#000',
     shadowOpacity: 0.35,
     shadowRadius: 12,
     shadowOffset: { width: 0, height: 8 },
-    elevation: 30,
   },
   sugHint: { color: '#9ca3af', textAlign: 'center', paddingVertical: 8 },
   sugItem: { paddingVertical: 10, paddingHorizontal: 12, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#243143' },
@@ -830,6 +829,8 @@ const styles = StyleSheet.create({
   smsButton: {
     marginTop: 12, backgroundColor: '#28a745', padding: 14,
     borderRadius: 10, alignItems: 'center',
+    position: 'relative',
+    zIndex: 1, // plus bas que phoneWrap/sugPanel
   },
   buttonText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
 
