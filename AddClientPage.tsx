@@ -28,7 +28,6 @@ const toE164FR = (raw: string): string => {
 };
 const isPhone10 = (p: string) => /^\d{10}$/.test(p);
 
-/** strict: vrai si le numéro `p` correspond réellement à la saisie `q` */
 const phoneMatches = (p: string, q: string) => {
   const sp = sanitizePhone(p);
   const sq = sanitizePhone(q);
@@ -103,7 +102,35 @@ const getStableLicenceId = async (): Promise<string | null> => {
   return null;
 };
 
-/** Map vers le format serveur /api/clients/upsert */
+/** Coercition des consentements depuis différentes formes possibles */
+const coerceConsent = (src: any) => {
+  // service
+  const service =
+    // structure "consent.service_sms.value"
+    !!src?.consent?.service_sms?.value ||
+    // booléens à plat
+    src?.service_sms === true ||
+    src?.service === true ||
+    src?.consentService === true ||
+    src?.consentementService === true ||
+    // "1", "oui", 1
+    src?.service_sms === 1 || src?.service_sms === '1' ||
+    String(src?.service_sms).toLowerCase?.() === 'oui';
+
+  // marketing
+  const marketing =
+    !!src?.consent?.marketing_sms?.value ||
+    src?.marketing_sms === true ||
+    src?.marketing === true ||
+    src?.consentMarketing === true ||
+    src?.consentementMarketing === true ||
+    src?.marketing_sms === 1 || src?.marketing_sms === '1' ||
+    String(src?.marketing_sms).toLowerCase?.() === 'oui';
+
+  return { service, marketing };
+};
+
+/** Map vers le format serveur /api/clients/upsert (inclut consent) */
 const toServerClient = (local: any, stableId?: string) => {
   const now = new Date().toISOString();
   const lensDuration =
@@ -112,6 +139,23 @@ const toServerClient = (local: any, stableId?: string) => {
     local.journ90 ? '90j' :
     local.mens6  ? '6mois' :
     local.mens12 ? '1an'   : null;
+
+  const consent = {
+    service_sms: {
+      value: !!local?.consent?.service_sms?.value,
+      collectedAt: local?.consent?.service_sms?.collectedAt || now,
+      source: local?.consent?.service_sms?.source || 'in_store',
+      proof: local?.consent?.service_sms?.proof || 'case-cochée-app',
+      unsubscribedAt: local?.consent?.service_sms?.unsubscribedAt || null,
+    },
+    marketing_sms: {
+      value: !!local?.consent?.marketing_sms?.value || !!local?.consentementMarketing,
+      collectedAt: local?.consent?.marketing_sms?.collectedAt || now,
+      source: local?.consent?.marketing_sms?.source || 'in_store',
+      proof: local?.consent?.marketing_sms?.proof || 'case-cochée-app',
+      unsubscribedAt: local?.consent?.marketing_sms?.unsubscribedAt || null,
+    },
+  };
 
   return {
     id: stableId || local.id || `c-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
@@ -124,6 +168,7 @@ const toServerClient = (local: any, stableId?: string) => {
     lensEndDate: null,
     lensDuration,
     note: '',
+    consent,
     updatedAt: now,
   };
 };
@@ -173,7 +218,7 @@ export default function AddClientPage() {
   const [mens6, setMens6] = useState(false);
   const [mens12, setMens12] = useState(false);
 
-  // Consentements
+  // Consentements (cases à cocher)
   const [consentService, setConsentService] = useState(false);
   const [consentMarketing, setConsentMarketing] = useState(false);
 
@@ -198,10 +243,11 @@ export default function AddClientPage() {
   const [sendStep, setSendStep] = useState<'prep' | 'send' | 'done' | 'error'>('prep');
   const [sendError, setSendError] = useState<string | null>(null);
 
-  // ========= SUGGESTIONS (anti-doublon par téléphone) =========
+  // ========= SUGGESTIONS =========
   type LightClient = {
     id?: string; prenom?: string; nom?: string; phone?: string; telephone?: string; email?: string;
     lunettes?: boolean; lentilles?: any[]; dateNaissance?: string; consent?: any; consentementMarketing?: boolean;
+    consentService?: boolean; consentMarketing?: boolean; service_sms?: any; marketing_sms?: any;
   };
   const [suggestions, setSuggestions] = useState<LightClient[]>([]);
   const [loadingSug, setLoadingSug] = useState(false);
@@ -209,7 +255,6 @@ export default function AddClientPage() {
   const debounceRef = useRef<any>(null);
   const [selectedExistingId, setSelectedExistingId] = useState<string | null>(null);
 
-  /** Récupération par ID (essaie plusieurs routes), sinon repli */
   const fetchClientById = useCallback(async (id: string): Promise<LightClient | null> => {
     const lic = licenceIdRef.current || await getStableLicenceId();
     licenceIdRef.current = lic;
@@ -233,7 +278,6 @@ export default function AddClientPage() {
         }
       } catch {}
     }
-    // repli local
     try {
       const raw = await AsyncStorage.getItem('clients');
       const local: any[] = raw ? JSON.parse(raw) : [];
@@ -243,7 +287,6 @@ export default function AddClientPage() {
     return null;
   }, []);
 
-  /** Recherche robuste côté serveur avec repli local + FILTRE STRICT Téléphone */
   const searchClientsRemote = useCallback(async (q: string): Promise<LightClient[]> => {
     const lic = licenceIdRef.current || await getStableLicenceId();
     licenceIdRef.current = lic;
@@ -318,7 +361,7 @@ export default function AddClientPage() {
     }, 220);
   }, [searchClientsRemote]);
 
-  /** Remplit tous les champs depuis un objet "complet" */
+  /** Remplit tous les champs depuis un objet "complet" (inclut consentements coercés) */
   const hydrateFrom = useCallback((c: any) => {
     const phone = sanitizePhone(c.phone || c.telephone || telephone);
     setSelectedExistingId(String(c.id || ''));
@@ -336,11 +379,10 @@ export default function AddClientPage() {
     setMens6(arr.includes('6mois'));
     setMens12(arr.includes('1an'));
 
-    // consentements
-    const svc = !!c?.consent?.service_sms?.value;
-    const mkt = !!c?.consent?.marketing_sms?.value || !!c.consentementMarketing;
-    setConsentService(svc);
-    setConsentMarketing(mkt);
+    // consentements (coercion robuste)
+    const cc = coerceConsent(c);
+    setConsentService(!!cc.service);
+    setConsentMarketing(!!cc.marketing);
 
     // date naissance
     const dn = String(c.dateNaissance || c.naissance || '');
@@ -349,7 +391,6 @@ export default function AddClientPage() {
     else { setBDay(''); setBMonth(''); setBYear(''); }
   }, [telephone]);
 
-  /** AU CLIC : va chercher le dossier complet par ID, sinon prend la suggestion, puis hydrate les champs */
   const selectSuggestion = useCallback(async (c: LightClient) => {
     setShowSug(false);
     const id = String(c.id || '');
@@ -362,7 +403,6 @@ export default function AddClientPage() {
 
     hydrateFrom(full);
 
-    // petit toast d’info
     setToast({ visible: true, text: '📂 Dossier chargé' });
     setTimeout(() => setToast({ visible: false, text: '' }), 1200);
   }, [fetchClientById, hydrateFrom]);
@@ -424,7 +464,7 @@ export default function AddClientPage() {
       return showToast('❌ Échec sauvegarde locale');
     }
 
-    // 2) Push serveur
+    // 2) Push serveur (inclut consent)
     try {
       const licenceId = licenceIdRef.current || await getStableLicenceId();
       licenceIdRef.current = licenceId;
@@ -722,7 +762,7 @@ export default function AddClientPage() {
         <Text style={styles.homeButtonText}>🏠 Retour à l’accueil</Text>
       </TouchableOpacity>
 
-      {/* Modales SMS / Custom / Date + Progress + Toast (inchangés sauf styles) */}
+      {/* Modales & progress & toast */}
       <Modal visible={showSMSModal} transparent animationType="fade" onRequestClose={() => setShowSMSModal(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
