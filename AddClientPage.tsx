@@ -28,6 +28,21 @@ const toE164FR = (raw: string): string => {
 };
 const isPhone10 = (p: string) => /^\d{10}$/.test(p);
 
+/** strict: retourne vrai si le numéro `p` correspond réellement à la saisie `q` */
+const phoneMatches = (p: string, q: string) => {
+  const sp = sanitizePhone(p);
+  const sq = sanitizePhone(q);
+  if (!sq) return false;
+  // tant qu'on a moins de 6 chiffres, on ne “suggère” pas
+  if (sq.length < 6) return false;
+  // à partir de 6 chiffres saisis: il faut que le début du numéro stocké corresponde
+  if (sp.startsWith(sq)) return true;
+  // et on accepte l'entrée si l'utilisateur a tapé plus que le stocké (cas rare)
+  if (sq.startsWith(sp) && sp.length >= 6) return true;
+  // variante E.164 (sécurité)
+  return toE164FR(sp).startsWith(toE164FR(sq));
+};
+
 const DEFAULT_TEMPLATES: Record<'Lunettes' | 'SAV' | 'Lentilles' | 'Commande', string> = {
   Lunettes:  'Bonjour {prenom} {nom}, vos lunettes sont prêtes. À bientôt !',
   SAV:       'Bonjour {prenom} {nom}, votre SAV est terminé, vous pouvez venir le récupérer.',
@@ -195,15 +210,13 @@ export default function AddClientPage() {
   const debounceRef = useRef<any>(null);
   const [selectedExistingId, setSelectedExistingId] = useState<string | null>(null);
 
-  /** Recherche robuste côté serveur avec repli local */
+  /** Recherche robuste côté serveur avec repli local + FILTRE STRICT Téléphone */
   const searchClientsRemote = useCallback(async (q: string): Promise<LightClient[]> => {
     const lic = licenceIdRef.current || await getStableLicenceId();
     licenceIdRef.current = lic;
     if (!lic) return [];
 
     const clean = sanitizePhone(q);
-    const e164 = toE164FR(clean);
-
     const tryParse = (j: any): LightClient[] => {
       if (Array.isArray(j)) return j as any[];
       if (Array.isArray(j?.clients)) return j.clients as any[];
@@ -211,6 +224,10 @@ export default function AddClientPage() {
       if (Array.isArray(j?.data)) return j.data as any[];
       return [];
     };
+    const normalize = (c: any) => ({ ...c, phone: sanitizePhone(c.phone || c.telephone || '') });
+
+    const postFilter = (arr: any[]): LightClient[] =>
+      (arr || []).map(normalize).filter((c: any) => phoneMatches(c.phone, clean));
 
     const urls = [
       `${SERVER_BASE}/api/clients/by-phone?licenceId=${encodeURIComponent(lic)}&phone=${encodeURIComponent(clean)}`,
@@ -224,7 +241,7 @@ export default function AddClientPage() {
         const r = await fetch(url);
         if (!r.ok) continue;
         const j = await r.json().catch(() => ({}));
-        const arr = tryParse(j);
+        const arr = postFilter(tryParse(j));
         if (arr.length) return arr;
       } catch {}
     }
@@ -234,23 +251,18 @@ export default function AddClientPage() {
       const r = await fetch(`${SERVER_BASE}/api/clients?licenceId=${encodeURIComponent(lic)}`);
       if (r.ok) {
         const j = await r.json().catch(() => ({}));
-        const arr = tryParse(j);
-        const out = (arr || []).filter((c: any) => {
-          const p = sanitizePhone(c.phone || c.telephone || '');
-          return p.startsWith(clean) || toE164FR(p).startsWith(e164);
-        });
-        if (out.length) return out;
+        const arr = postFilter(tryParse(j));
+        if (arr.length) return arr;
       }
     } catch {}
 
-    // 3) Dernier repli : cache local
+    // 3) Repli ultime : cache local
     try {
       const data = await AsyncStorage.getItem('clients');
       const local: any[] = data ? JSON.parse(data) : [];
-      return (local || []).filter((c: any) => {
-        const p = sanitizePhone(c.telephone || c.phone || '');
-        return p.startsWith(clean);
-      });
+      return (local || [])
+        .map(normalize)
+        .filter((c) => phoneMatches(c.phone, clean));
     } catch { return []; }
   }, []);
 
@@ -260,16 +272,18 @@ export default function AddClientPage() {
     setSelectedExistingId(null);
 
     if (debounceRef.current) clearTimeout(debounceRef.current);
+
+    // n’ouvre PAS la liste avant 6 chiffres saisis
     if (clean.length < 6) {
       setSuggestions([]);
       setShowSug(false);
       return;
     }
+
     debounceRef.current = setTimeout(async () => {
       setLoadingSug(true);
       const res = await searchClientsRemote(clean);
-      const out = (res || []).map((c: any) => ({ ...c, phone: sanitizePhone(c.phone || c.telephone || '') }));
-      setSuggestions(out);
+      setSuggestions(res || []);
       setShowSug(true);
       setLoadingSug(false);
     }, 220);
@@ -535,7 +549,7 @@ export default function AddClientPage() {
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.label}>Téléphone *</Text>
-      <View style={{ position: 'relative', zIndex: 20 /* au-dessus du bouton */ }}>
+      <View style={{ position: 'relative', zIndex: 50 /* au-dessus du bouton */ }}>
         <TextInput
           style={styles.input}
           keyboardType={Platform.OS === 'web' ? 'text' : 'phone-pad'}
@@ -552,31 +566,34 @@ export default function AddClientPage() {
               <Text style={styles.sugHint}>Aucun dossier trouvé</Text>
             )}
 
-            {suggestions.slice(0, 6).map((c, idx) => {
-              const p = sanitizePhone((c.phone as any) || (c.telephone as any) || '');
-              return (
-                <TouchableOpacity
-                  key={(c as any).id || p || idx}
-                  style={styles.sugItem}
-                  onPress={() => selectSuggestion(c)}
-                >
-                  <Text style={styles.sugItemTitle}>
-                    {(c.prenom || '').toString()} {(c.nom || '').toString()}
-                  </Text>
-                  <Text style={styles.sugItemSub}>{p || '—'}</Text>
-                </TouchableOpacity>
-              );
-            })}
+            <ScrollView style={{ maxHeight: 260 }}>
+              {suggestions.slice(0, 20).map((c, idx) => {
+                const p = sanitizePhone((c.phone as any) || (c.telephone as any) || '');
+                return (
+                  <TouchableOpacity
+                    key={(c as any).id || p || idx}
+                    style={styles.sugItem}
+                    onPress={() => selectSuggestion(c)}
+                  >
+                    <Text style={styles.sugItemTitle}>
+                      {(c.prenom || '').toString()} {(c.nom || '').toString()}
+                    </Text>
+                    <Text style={styles.sugItemSub}>{p || '—'}</Text>
+                  </TouchableOpacity>
+                );
+              })}
 
-            {isPhone10(telephone) && suggestions.some(s => sanitizePhone((s.phone as any) || (s.telephone as any)) === telephone) && (
-              <TouchableOpacity
-                style={[styles.sugItem, { backgroundColor: '#0f172a' }]}
-                onPress={() => { setSelectedExistingId(null); setShowSug(false); }}
-              >
-                <Text style={[styles.sugItemTitle, { color: '#93c5fd' }]}>Créer un nouveau dossier avec ce numéro</Text>
-                <Text style={styles.sugItemSub}>Ex : enfant / parent de la même famille</Text>
-              </TouchableOpacity>
-            )}
+              {/* Option : créer un nouveau dossier avec ce numéro (même famille) */}
+              {isPhone10(telephone) && suggestions.some(s => sanitizePhone((s.phone as any) || (s.telephone as any)) === telephone) && (
+                <TouchableOpacity
+                  style={[styles.sugItem, { backgroundColor: '#0f172a' }]}
+                  onPress={() => { setSelectedExistingId(null); setShowSug(false); }}
+                >
+                  <Text style={[styles.sugItemTitle, { color: '#93c5fd' }]}>Créer un nouveau dossier avec ce numéro</Text>
+                  <Text style={styles.sugItemSub}>Ex : enfant / parent de la même famille</Text>
+                </TouchableOpacity>
+              )}
+            </ScrollView>
 
             <TouchableOpacity style={styles.sugClose} onPress={() => setShowSug(false)}>
               <Text style={{ color: '#9ca3af', fontWeight: '600' }}>Fermer</Text>
@@ -662,12 +679,12 @@ export default function AddClientPage() {
         <Text style={styles.homeButtonText}>🏠 Retour à l’accueil</Text>
       </TouchableOpacity>
 
-      {/* Modale choix (4 + personnalisé) */}
+      {/* Modales (SMS / Custom / Date) et Progress, Toast — inchangés */}
+      {/* --- SMS type --- */}
       <Modal visible={showSMSModal} transparent animationType="fade" onRequestClose={() => setShowSMSModal(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Type de message :</Text>
-
             {(['Lunettes','SAV','Lentilles','Commande'] as const).map((label) => (
               <TouchableOpacity
                 key={label}
@@ -678,27 +695,24 @@ export default function AddClientPage() {
                   setTimeout(() => sendTemplate(label), 60);
                 }}
                 activeOpacity={0.7}
-                accessibilityRole="button"
               >
                 <Text style={styles.modalButtonText}>{label}</Text>
               </TouchableOpacity>
             ))}
-
             <TouchableOpacity
               style={[styles.modalButton, { marginTop: 8 }]}
               onPress={() => { setShowSMSModal(false); setCustomText(''); setTimeout(() => setShowCustomModal(true), 50); }}
             >
               <Text style={styles.modalButtonText}>Personnalisé</Text>
             </TouchableOpacity>
-
-            <TouchableOpacity onPress={() => setShowSMSModal(false)} accessibilityRole="button">
+            <TouchableOpacity onPress={() => setShowSMSModal(false)}>
               <Text style={styles.modalCancel}>Annuler</Text>
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
-      {/* Modale "Personnalisé" */}
+      {/* --- SMS personnalisé --- */}
       <Modal visible={showCustomModal} transparent animationType="fade" onRequestClose={() => setShowCustomModal(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
@@ -712,21 +726,19 @@ export default function AddClientPage() {
               placeholderTextColor="#aaa"
               multiline
             />
-
             <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
               <TouchableOpacity style={[styles.modalActionBtn, { backgroundColor: '#28a745', flex: 1 }]} onPress={sendCustom}>
                 <Text style={styles.modalActionText}>Envoyer</Text>
               </TouchableOpacity>
             </View>
-
-            <TouchableOpacity onPress={() => setShowCustomModal(false)} accessibilityRole="button">
+            <TouchableOpacity onPress={() => setShowCustomModal(false)}>
               <Text style={[styles.modalCancel, { marginTop: 10 }]}>Fermer</Text>
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
-      {/* Modale de sélection jour/mois/année */}
+      {/* --- Sélecteurs JJ/MM/AAAA --- */}
       <Modal visible={pickerOpen !== null} transparent animationType="fade" onRequestClose={() => setPickerOpen(null)}>
         <View style={styles.modalOverlay}>
           <View style={styles.pickerCard}>
@@ -734,7 +746,7 @@ export default function AddClientPage() {
               {pickerOpen === 'day' ? 'Sélectionner le jour' : pickerOpen === 'month' ? 'Sélectionner le mois' : 'Sélectionner l’année'}
             </Text>
             <ScrollView style={{ maxHeight: 300, alignSelf: 'stretch' }}>
-              {pickerList.map((opt: any) => (
+              {(pickerOpen === 'day' ? dayOptions : pickerOpen === 'month' ? monthOptions : yearOptions).map((opt: any) => (
                 <TouchableOpacity
                   key={opt.value}
                   style={styles.pickerItem}
@@ -756,7 +768,7 @@ export default function AddClientPage() {
         </View>
       </Modal>
 
-      {/* Progress envoi SMS */}
+      {/* --- Progress envoi SMS --- */}
       <Modal visible={sending} transparent animationType="fade" onRequestClose={() => { if (sendStep !== 'send') setSending(false); }}>
         <View style={styles.modalOverlay}>
           <View style={styles.progressCard}>
@@ -770,7 +782,6 @@ export default function AddClientPage() {
               {sendStep === 'done' && <Text style={styles.progressOk}>✓ Terminé</Text>}
               {sendStep === 'error' && <Text style={styles.progressErr}>✗ {sendError || 'Erreur inconnue'}</Text>}
             </View>
-
             {sendStep === 'error' && (
               <TouchableOpacity
                 style={[styles.modalActionBtn, { backgroundColor: '#ff3b30', marginTop: 12 }]}
@@ -783,7 +794,7 @@ export default function AddClientPage() {
         </View>
       </Modal>
 
-      {/* Toast */}
+      {/* --- Toast --- */}
       {toast.visible && (
         <View style={styles.toast}>
           <Text style={styles.toastText}>{toast.text}</Text>
@@ -806,7 +817,7 @@ const styles = StyleSheet.create({
     padding: 10, marginTop: 4, color: '#fff', backgroundColor: '#111',
   },
 
-  // SUGGESTIONS (zIndex élevé pour passer devant le bouton)
+  // SUGGESTIONS (zIndex + hauteur max + scroll)
   sugPanel: {
     position: 'absolute',
     top: 52,
@@ -817,21 +828,22 @@ const styles = StyleSheet.create({
     borderColor: '#374151',
     borderRadius: 10,
     paddingVertical: 8,
-    zIndex: 50,
+    zIndex: 999,
+    elevation: 12,
   },
   sugHint: { color: '#9ca3af', textAlign: 'center', paddingVertical: 8 },
-  sugItem: { paddingVertical: 10, paddingHorizontal: 12, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#374151' },
+  sugItem: { paddingVertical: 12, paddingHorizontal: 14, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#374151' },
   sugItemTitle: { color: '#e5e7eb', fontWeight: '700' },
   sugItemSub: { color: '#9ca3af', marginTop: 2 },
   sugClose: {
     alignSelf: 'center',
     marginTop: 6,
     paddingVertical: 6,
-    paddingHorizontal: 10,
+    paddingHorizontal: 12,
     borderRadius: 8,
     backgroundColor: '#0b0b0b',
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#333'
+    borderColor: '#333',
   },
 
   // Date of birth selects
@@ -850,7 +862,7 @@ const styles = StyleSheet.create({
 
   button: {
     marginTop: 24, backgroundColor: '#007AFF', padding: 14,
-    borderRadius: 10, alignItems: 'center', zIndex: 0,
+    borderRadius: 10, alignItems: 'center',
   },
   smsButton: {
     marginTop: 12, backgroundColor: '#28a745', padding: 14,
