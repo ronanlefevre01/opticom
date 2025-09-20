@@ -1,3 +1,4 @@
+// AddClientPage.tsx
 import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
@@ -48,8 +49,7 @@ const appendSignature = (msg: string, sig: string) => {
   const s = (sig || '').trim();
   if (!s) return m;
   const norm = (x: string) => x.replace(/\s+/g, ' ').trim().toLowerCase();
-  // évite doublons de signature
-  if (norm(m).endsWith(norm(s))) return m;
+  if (norm(m).endsWith(norm(s))) return m; // évite doublons de signature
   const needsSpace = /[.!?]\s*$/.test(m);
   const sep = needsSpace ? ' ' : ' — ';
   return `${m}${sep}${s}`;
@@ -123,7 +123,7 @@ export default function AddClientPage() {
   const route = useRoute<any>();
   const { mode, client }: RouteParams = route.params || {};
 
-  // cache mémoire (évite d’appeler getStableLicenceId plusieurs fois)
+  // licence cache
   const licenceIdRef = useRef<string | null>(null);
   useEffect(() => {
     let alive = true;
@@ -142,7 +142,7 @@ export default function AddClientPage() {
   const [telephone, setTelephone] = useState('');
   const [email, setEmail] = useState('');
 
-  // Date de naissance (JJ/MM/AAAA via 3 menus)
+  // Date de naissance
   const [bDay, setBDay] = useState('');
   const [bMonth, setBMonth] = useState('');
   const [bYear, setBYear] = useState('');
@@ -182,69 +182,103 @@ export default function AddClientPage() {
   const [sendStep, setSendStep] = useState<'prep' | 'send' | 'done' | 'error'>('prep');
   const [sendError, setSendError] = useState<string | null>(null);
 
-  // Options date
-  const dayOptions = useMemo(
-    () => Array.from({ length: 31 }, (_, i) => {
-      const v = String(i + 1).padStart(2, '0');
-      return { value: v, label: v };
-    }),
-    []
-  );
-  const monthOptions = useMemo(
-    () => ([
-      ['01', 'Jan.'], ['02', 'Fév.'], ['03', 'Mars'], ['04', 'Avr.'], ['05', 'Mai'], ['06', 'Juin'],
-      ['07', 'Juil.'], ['08', 'Août'], ['09', 'Sept.'], ['10', 'Oct.'], ['11', 'Nov.'], ['12', 'Déc.'],
-    ] as const).map(([v, l]) => ({ value: v, label: `${v} — ${l}` })),
-    []
-  );
-  const yearOptions = useMemo(() => {
-    const currentYear = new Date().getFullYear();
-    return Array.from({ length: currentYear - 1900 + 1 }, (_, i) => {
-      const y = String(currentYear - i);
-      return { value: y, label: y };
-    });
+  // ========= SUGGESTIONS (anti-doublon par téléphone) =========
+  type LightClient = { id?: string; prenom?: string; nom?: string; phone?: string; telephone?: string; email?: string; lunettes?: boolean; lentilles?: any[]; dateNaissance?: string; };
+  const [suggestions, setSuggestions] = useState<LightClient[]>([]);
+  const [loadingSug, setLoadingSug] = useState(false);
+  const [showSug, setShowSug] = useState(false);
+  const debounceRef = useRef<any>(null);
+  const [selectedExistingId, setSelectedExistingId] = useState<string | null>(null);
+
+  const searchClientsRemote = useCallback(async (q: string): Promise<LightClient[]> => {
+    const lic = licenceIdRef.current || await getStableLicenceId();
+    licenceIdRef.current = lic;
+    if (!lic) return [];
+    const urls = [
+      `${SERVER_BASE}/api/clients/search?licenceId=${encodeURIComponent(lic)}&q=${encodeURIComponent(q)}`,
+      `${SERVER_BASE}/api/clients?licenceId=${encodeURIComponent(lic)}&q=${encodeURIComponent(q)}`,
+      `${SERVER_BASE}/api/clients/by-phone?licenceId=${encodeURIComponent(lic)}&phone=${encodeURIComponent(q)}`
+    ];
+    for (const url of urls) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) continue;
+        const j = await r.json().catch(() => ({}));
+        if (Array.isArray(j)) return j as any[];
+        if (Array.isArray(j.clients)) return j.clients as any[];
+        if (Array.isArray(j.items)) return j.items as any[];
+      } catch {}
+    }
+    return [];
   }, []);
+
+  const handlePhoneChange = useCallback((val: string) => {
+    const clean = sanitizePhone(val);
+    setTelephone(clean);
+    setSelectedExistingId(null);
+
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (clean.length < 6) {
+      setSuggestions([]);
+      setShowSug(false);
+      return;
+    }
+    debounceRef.current = setTimeout(async () => {
+      setLoadingSug(true);
+      const res = await searchClientsRemote(clean);
+      // normalise phone
+      const out = (res || []).map((c: any) => ({ ...c, phone: sanitizePhone(c.phone || c.telephone || '') }));
+      setSuggestions(out);
+      setShowSug(true);
+      setLoadingSug(false);
+    }, 220);
+  }, [searchClientsRemote]);
+
+  const selectSuggestion = useCallback((c: LightClient) => {
+    const phone = sanitizePhone((c.phone as any) || (c.telephone as any) || telephone);
+    setSelectedExistingId(String(c.id || ''));
+    setTelephone(phone);
+    setNom(String(c.nom || ''));
+    setPrenom(String(c.prenom || ''));
+    setEmail(String((c as any).email || ''));
+    // produits si dispo
+    setLunettes(!!c.lunettes);
+    const arr: string[] = Array.isArray(c.lentilles) ? c.lentilles as any : [];
+    setJourn30(arr.includes('30j'));
+    setJourn60(arr.includes('60j'));
+    setJourn90(arr.includes('90j'));
+    setMens6(arr.includes('6mois'));
+    setMens12(arr.includes('1an'));
+    // date naissance
+    const dn = String((c as any).dateNaissance || '');
+    const mt = dn.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+    if (mt) { setBDay(mt[1].padStart(2,'0')); setBMonth(mt[2].padStart(2,'0')); setBYear(mt[3]); }
+    setShowSug(false);
+  }, [telephone]);
 
   // Pré-remplissage en mode édition + chargement modèles
   useEffect(() => {
     if (mode === 'edit' && client) {
       const c: any = client;
-
+      setSelectedExistingId(String(c.id || '') || null);
       setNom(String(c.nom || ''));
       setPrenom(String(c.prenom || ''));
       setTelephone(String(c.telephone || ''));
       setEmail(String(c.email || ''));
-
       const dn = String(c.dateNaissance || '');
       const mt = dn.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
-      if (mt) {
-        setBDay(mt[1].padStart(2, '0'));
-        setBMonth(mt[2].padStart(2, '0'));
-        setBYear(mt[3]);
-      } else {
-        setBDay(''); setBMonth(''); setBYear('');
-      }
-
+      if (mt) { setBDay(mt[1].padStart(2, '0')); setBMonth(mt[2].padStart(2, '0')); setBYear(mt[3]); } else { setBDay(''); setBMonth(''); setBYear(''); }
       setLunettes(!!c.lunettes);
       const arr: string[] = Array.isArray(c.lentilles) ? c.lentilles : [];
-      setJourn30(arr.includes('30j'));
-      setJourn60(arr.includes('60j'));
-      setJourn90(arr.includes('90j'));
-      setMens6(arr.includes('6mois'));
-      setMens12(arr.includes('1an'));
-
+      setJourn30(arr.includes('30j')); setJourn60(arr.includes('60j')); setJourn90(arr.includes('90j'));
+      setMens6(arr.includes('6mois')); setMens12(arr.includes('1an'));
       setConsentService(!!c?.consent?.service_sms?.value);
       setConsentMarketing(!!c?.consent?.marketing_sms?.value || !!c.consentementMarketing);
     }
-
-    AsyncStorage.getItem('messages').then((data) => {
-      if (!data) return;
-      try { setMessages(JSON.parse(data)); } catch {}
-    });
+    AsyncStorage.getItem('messages').then((data) => { if (!data) return; try { setMessages(JSON.parse(data)); } catch {} });
   }, [mode, client]);
 
-  const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>) =>
-    setter(prev => !prev);
+  const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>) => setter(prev => !prev);
 
   /** SAVE + SYNC SERVEUR */
   const handleSave = useCallback(async () => {
@@ -255,42 +289,30 @@ export default function AddClientPage() {
 
     const now = new Date().toISOString();
 
-    // 1) Construire un client local (pour l’UI)
     const localClient: any = {
-      id: (client as any)?.id,
+      id: selectedExistingId || (client as any)?.id, // ← si suggestion choisie, on met à jour l’existant
       nom, prenom, telephone: tel, email,
       dateNaissance,
       lunettes,
       lentilles: [journ30 && '30j', journ60 && '60j', journ90 && '90j', mens6 && '6mois', mens12 && '1an'].filter(Boolean),
       consentementMarketing: consentMarketing,
       consent: {
-        service_sms: {
-          value: consentService,
-          collectedAt: consentService ? now : undefined,
-          source: 'in_store',
-          proof: consentService ? 'case-cochée-app' : undefined,
-          unsubscribedAt: null,
-        },
-        marketing_sms: {
-          value: consentMarketing,
-          collectedAt: consentMarketing ? now : undefined,
-          source: 'in_store',
-          proof: consentMarketing ? 'case-cochée-app' : undefined,
-          unsubscribedAt: null,
-        },
+        service_sms: { value: consentService, collectedAt: consentService ? now : undefined, source: 'in_store', proof: consentService ? 'case-cochée-app' : undefined, unsubscribedAt: null },
+        marketing_sms: { value: consentMarketing, collectedAt: consentMarketing ? now : undefined, source: 'in_store', proof: consentMarketing ? 'case-cochée-app' : undefined, unsubscribedAt: null },
       },
       messagesEnvoyes: mode === 'edit' ? (client as any)?.messagesEnvoyes || [] : [],
       createdAt: mode === 'edit' ? (client as any)?.createdAt || now : now,
       updatedAt: now,
     };
 
-    // 2) Sauvegarde locale immédiate
+    // 1) Sauvegarde locale
     try {
       const data = await AsyncStorage.getItem('clients');
       let clients: any[] = data ? JSON.parse(data) : [];
-
       const idxExisting = clients.findIndex(
-        (c) => (localClient.id && c.id === localClient.id) || sanitizePhone(c.telephone) === tel
+        (c) =>
+          (localClient.id && c.id === localClient.id) ||
+          sanitizePhone(c.telephone) === tel
       );
       if (idxExisting >= 0) {
         clients[idxExisting] = { ...clients[idxExisting], ...localClient };
@@ -305,32 +327,25 @@ export default function AddClientPage() {
       return showToast('❌ Échec sauvegarde locale');
     }
 
-    // 3) Push serveur
+    // 2) Push serveur
     try {
       const licenceId = licenceIdRef.current || await getStableLicenceId();
       licenceIdRef.current = licenceId;
-      if (!licenceId) {
-        console.warn('LicenceId introuvable → pas de synchro serveur');
-        return;
-      }
+      if (!licenceId) { console.warn('LicenceId introuvable'); return; }
       const serverClient = toServerClient(
         { ...localClient, journ30, journ60, journ90, mens6, mens12 },
         localClient.id
       );
-
       const resp = await fetch(`${SERVER_BASE}/api/clients/upsert`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ licenceId, clients: [serverClient] }),
       });
-
       if (!resp.ok) {
         const t = await resp.text().catch(() => '');
         console.error('Push serveur KO:', resp.status, t);
         return showToast('⚠️ Synchro serveur échouée');
       }
-
-      // 4) Met à jour l’entrée locale avec l’id/updatedAt final
       const data2 = await AsyncStorage.getItem('clients');
       let clients2: any[] = data2 ? JSON.parse(data2) : [];
       const j = clients2.findIndex(
@@ -349,7 +364,7 @@ export default function AddClientPage() {
   }, [
     telephone, nom, prenom, email, dateNaissance,
     lunettes, journ30, journ60, journ90, mens6, mens12,
-    consentMarketing, consentService, client, mode, showToast
+    consentMarketing, consentService, client, mode, showToast, selectedExistingId
   ]);
 
   /* =========================
@@ -424,36 +439,22 @@ export default function AddClientPage() {
   }, [telephone]);
 
   const sendTemplate = useCallback(async (templateKey: 'Lunettes' | 'SAV' | 'Lentilles' | 'Commande') => {
-    if (!consentService) {
-      showToast('⛔ Consentement Service requis');
-      return;
-    }
+    if (!consentService) { showToast('⛔ Consentement Service requis'); return; }
     const fromStore = messages[templateKey]?.content;
     const template = fromStore && typeof fromStore === 'string' ? fromStore : DEFAULT_TEMPLATES[templateKey];
     const sig = await getSignatureFromSettings();
     const finalMessage = appendSignature(buildMessageFromTemplate(template), sig);
-
     const ok = await sendTransactionalSMS(telephone.trim(), finalMessage);
     if (ok) await logMessageSend(templateKey);
   }, [messages, consentService, telephone, buildMessageFromTemplate, sendTransactionalSMS, logMessageSend, showToast]);
 
   const sendCustom = useCallback(async () => {
-    if (!consentService) {
-      showToast('⛔ Consentement Service requis');
-      return;
-    }
+    if (!consentService) { showToast('⛔ Consentement Service requis'); return; }
     const sig = await getSignatureFromSettings();
     const finalMessage = appendSignature(buildMessageFromTemplate(customText), sig);
-
-    setSending(true);
-    setSendStep('prep');
-    setSendError(null);
-
+    setSending(true); setSendStep('prep'); setSendError(null);
     const ok = await sendTransactionalSMS(telephone.trim(), finalMessage);
-    if (ok) {
-      await logMessageSend('Personnalisé');
-      setShowCustomModal(false);
-    }
+    if (ok) { await logMessageSend('Personnalisé'); setShowCustomModal(false); }
   }, [consentService, customText, telephone, buildMessageFromTemplate, sendTransactionalSMS, logMessageSend, showToast]);
 
   const handleExpressSMS = useCallback(() => {
@@ -471,6 +472,22 @@ export default function AddClientPage() {
    * UI
    * ========================= */
 
+  const dayOptions = useMemo(() => Array.from({ length: 31 }, (_, i) => {
+    const v = String(i + 1).padStart(2, '0');
+    return { value: v, label: v };
+  }), []);
+  const monthOptions = useMemo(() =>
+    ([
+      ['01', 'Jan.'], ['02', 'Fév.'], ['03', 'Mars'], ['04', 'Avr.'], ['05', 'Mai'], ['06', 'Juin'],
+      ['07', 'Juil.'], ['08', 'Août'], ['09', 'Sept.'], ['10', 'Oct.'], ['11', 'Nov.'], ['12', 'Déc.'],
+    ] as const).map(([v, l]) => ({ value: v, label: `${v} — ${l}` })), []);
+  const yearOptions = useMemo(() => {
+    const currentYear = new Date().getFullYear();
+    return Array.from({ length: currentYear - 1900 + 1 }, (_, i) => {
+      const y = String(currentYear - i);
+      return { value: y, label: y };
+    });
+  }, []);
   const pickerList =
     pickerOpen === 'day' ? dayOptions :
     pickerOpen === 'month' ? monthOptions :
@@ -479,14 +496,56 @@ export default function AddClientPage() {
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.label}>Téléphone *</Text>
-      <TextInput
-        style={styles.input}
-        keyboardType={Platform.OS === 'web' ? 'text' : 'phone-pad'}
-        value={telephone}
-        onChangeText={setTelephone}
-        placeholder="0601020304"
-        placeholderTextColor="#777"
-      />
+      <View style={{ position: 'relative' }}>
+        <TextInput
+          style={styles.input}
+          keyboardType={Platform.OS === 'web' ? 'text' : 'phone-pad'}
+          value={telephone}
+          onChangeText={handlePhoneChange}
+          placeholder="0601020304"
+          placeholderTextColor="#777"
+        />
+        {/* SUGGESTIONS */}
+        {showSug && (
+          <View style={styles.sugPanel}>
+            {loadingSug && <Text style={styles.sugHint}>Recherche…</Text>}
+            {!loadingSug && suggestions.length === 0 && (
+              <Text style={styles.sugHint}>Aucun dossier trouvé</Text>
+            )}
+
+            {suggestions.slice(0, 6).map((c, idx) => {
+              const p = sanitizePhone((c.phone as any) || (c.telephone as any) || '');
+              return (
+                <TouchableOpacity
+                  key={(c as any).id || p || idx}
+                  style={styles.sugItem}
+                  onPress={() => selectSuggestion(c)}
+                >
+                  <Text style={styles.sugItemTitle}>
+                    {(c.prenom || '').toString()} {(c.nom || '').toString()}
+                  </Text>
+                  <Text style={styles.sugItemSub}>{p || '—'}</Text>
+                </TouchableOpacity>
+              );
+            })}
+
+            {/* Option : créer un nouveau dossier avec ce numéro (même famille) */}
+            {isPhone10(telephone) && suggestions.some(s => sanitizePhone((s.phone as any) || (s.telephone as any)) === telephone) && (
+              <TouchableOpacity
+                style={[styles.sugItem, { backgroundColor: '#0f172a' }]}
+                onPress={() => { setSelectedExistingId(null); setShowSug(false); }}
+              >
+                <Text style={[styles.sugItemTitle, { color: '#93c5fd' }]}>Créer un nouveau dossier avec ce numéro</Text>
+                <Text style={styles.sugItemSub}>Ex : enfant / parent de la même famille</Text>
+              </TouchableOpacity>
+            )}
+
+            <TouchableOpacity style={styles.sugClose} onPress={() => setShowSug(false)}>
+              <Text style={{ color: '#9ca3af', fontWeight: '600' }}>Fermer</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </View>
 
       <TouchableOpacity style={styles.smsButton} onPress={handleExpressSMS}>
         <Text style={styles.buttonText}>📤 Envoi express (cocher “Service”)</Text>
@@ -708,6 +767,26 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: '#555', borderRadius: 6,
     padding: 10, marginTop: 4, color: '#fff', backgroundColor: '#111',
   },
+
+  // SUGGESTIONS
+  sugPanel: {
+    position: 'absolute',
+    top: 52,
+    left: 0,
+    right: 0,
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: '#374151',
+    borderRadius: 10,
+    paddingVertical: 8,
+    zIndex: 20,
+  },
+  sugHint: { color: '#9ca3af', textAlign: 'center', paddingVertical: 8 },
+  sugItem: { paddingVertical: 10, paddingHorizontal: 12, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#374151' },
+  sugItemTitle: { color: '#e5e7eb', fontWeight: '700' },
+  sugItemSub: { color: '#9ca3af', marginTop: 2 },
+  sugClose: { alignSelf: 'center', marginTop: 6, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, backgroundColor: '#111111' },
+
   // Date of birth selects
   dobRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6 },
   dobSelect: {
