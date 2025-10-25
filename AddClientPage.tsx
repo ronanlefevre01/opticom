@@ -106,14 +106,11 @@ const getStableLicenceId = async (): Promise<string | null> => {
 const coerceConsent = (src: any) => {
   // service
   const service =
-    // structure "consent.service_sms.value"
     !!src?.consent?.service_sms?.value ||
-    // booléens à plat
     src?.service_sms === true ||
     src?.service === true ||
     src?.consentService === true ||
     src?.consentementService === true ||
-    // "1", "oui", 1
     src?.service_sms === 1 || src?.service_sms === '1' ||
     String(src?.service_sms).toLowerCase?.() === 'oui';
 
@@ -442,15 +439,16 @@ export default function AddClientPage() {
       updatedAt: now,
     };
 
-    // 1) Sauvegarde locale
+    // 1) Sauvegarde locale — UPDATE par id uniquement, sinon CREATE (même téléphone autorisé)
     try {
       const data = await AsyncStorage.getItem('clients');
       let clients: any[] = data ? JSON.parse(data) : [];
-      const idxExisting = clients.findIndex(
-        (c) =>
-          (localClient.id && c.id === localClient.id) ||
-          sanitizePhone(c.telephone) === tel
-      );
+
+      let idxExisting = -1;
+      if (localClient.id) {
+        idxExisting = clients.findIndex((c) => c.id === localClient.id);
+      }
+
       if (idxExisting >= 0) {
         clients[idxExisting] = { ...clients[idxExisting], ...localClient };
       } else {
@@ -483,11 +481,10 @@ export default function AddClientPage() {
         console.error('Push serveur KO:', resp.status, t);
         return showToast('⚠️ Synchro serveur échouée');
       }
+      // Mise à jour locale par id UNIQUEMENT
       const data2 = await AsyncStorage.getItem('clients');
       let clients2: any[] = data2 ? JSON.parse(data2) : [];
-      const j = clients2.findIndex(
-        (c) => (localClient.id && c.id === localClient.id) || sanitizePhone(c.telephone) === tel
-      );
+      const j = clients2.findIndex((c) => c.id === serverClient.id);
       if (j >= 0) {
         clients2[j].id = serverClient.id;
         clients2[j].updatedAt = serverClient.updatedAt;
@@ -563,7 +560,20 @@ export default function AddClientPage() {
       const data = await AsyncStorage.getItem('clients');
       let clients: any[] = data ? JSON.parse(data) : [];
       const tel = sanitizePhone(telephone.trim());
-      const idx = clients.findIndex((c) => sanitizePhone(c.telephone) === tel);
+
+      // on privilégie l'id sélectionné (ou celui du client passé en param)
+      const idPref = selectedExistingId || (client as any)?.id;
+      let idx = -1;
+      if (idPref) {
+        idx = clients.findIndex((c) => c.id === idPref);
+      } else {
+        // sinon, seulement si un UNIQUE client possède ce numéro
+        const matches = clients
+          .map((c, i) => ({ i, tel: sanitizePhone(c.telephone) }))
+          .filter(x => x.tel === tel);
+        if (matches.length === 1) idx = matches[0].i;
+      }
+
       if (idx >= 0) {
         const iso = new Date().toISOString();
         clients[idx].messagesEnvoyes = Array.isArray(clients[idx].messagesEnvoyes)
@@ -573,7 +583,7 @@ export default function AddClientPage() {
         await AsyncStorage.setItem('clients', JSON.stringify(clients));
       }
     } catch {}
-  }, [telephone]);
+  }, [telephone, selectedExistingId, client]);
 
   const sendTemplate = useCallback(async (templateKey: 'Lunettes' | 'SAV' | 'Lentilles' | 'Commande') => {
     if (!consentService) { showToast('⛔ Consentement Service requis'); return; }

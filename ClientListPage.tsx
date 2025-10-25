@@ -118,68 +118,31 @@ type ServerSmsItem = {
   campaignName?: string; campaign?: string; title?: string; nom?: string; name?: string; template?: string;
 };
 
-const labelFromType = (t: string) => {
-  if (t === 'marketing') return 'Marketing';
-  if (t === 'transactional') return 'Transactionnel';
-  if (t === 'auto-anniv') return 'Anniv auto';
-  if (t === 'auto-renew') return 'Renouvellement auto';
-  return 'SMS';
-};
-
-/** essaie d’inférer une catégorie lisible pour l’historique */
 const coerceHistoryLabel = (rawType: string, label: string) => {
   const knownCats = ['Lunettes','Lentilles','SAV','Commande'] as const;
-  if (knownCats.includes(label as any)) return label;        // correspond à nos modèles
-  // sinon, basé sur le type serveur
+  if (knownCats.includes(label as any)) return label;
   if (rawType === 'marketing') return 'Marketing';
   if (rawType === 'transactional') return 'Transactionnel';
   if (rawType === 'auto-anniv') return 'Anniv auto';
   if (rawType === 'auto-renew') return 'Renouvellement auto';
-  // à défaut, garder le label de campagne si présent, sinon "SMS"
   return label || 'SMS';
-};
-
-const fetchSmsHistoryFromLicence = async (
-  licenceId: string,
-  cle?: string | null
-): Promise<ServerSmsItem[]> => {
-  const urls: string[] = [
-    `${API_BASE}/api/licence?id=${encodeURIComponent(licenceId)}`
-  ];
-  if (cle) {
-    urls.push(
-      `${API_BASE}/api/licence?cle=${encodeURIComponent(cle)}`,
-      `${API_BASE}/licence?cle=${encodeURIComponent(cle)}`
-    );
-  }
-
-  for (const url of urls) {
-    try {
-      const r = await fetch(url);
-      if (!r.ok) continue;
-
-      const data = await r.json();
-      const lic = data?.licence ?? data;
-      const items: any[] = Array.isArray(lic?.historiqueSms) ? lic.historiqueSms : [];
-      return items as ServerSmsItem[];
-    } catch {}
-  }
-  return [];
 };
 
 /* ---- mapping service row -> Client local ---- */
 const rowToClient = (s: ClientRow): Client => {
   const tel = sanitizePhone((s as any).telephone || (s as any).phone || (s as any).numero || '');
-  const birth =
-    (s as any).dateNaissance || (s as any).naissance || (s as any).birthday || '';
+  const birth = (s as any).dateNaissance || (s as any).naissance || (s as any).birthday || '';
 
   const srvMarketing =
     !!(s as any)?.consent?.marketing_sms?.value || !!(s as any)?.consentementMarketing;
   const srvService =
     (s as any)?.consent?.service_sms?.value ?? (s as any)?.consentementService ?? true;
 
+  // IMPORTANT : id serveur prioritaire ; sinon fallback unique (mais on évite l’agrégation par téléphone plus tard)
+  const id = (s as any).id ? String((s as any).id) : `ph-${tel || Math.random().toString(36).slice(2,8)}`;
+
   return {
-    id: String((s as any).id || tel || ''),
+    id,
     prenom: (s as any).prenom || '',
     nom: (s as any).nom || '',
     telephone: tel,
@@ -198,9 +161,11 @@ const rowToClient = (s: ClientRow): Client => {
   };
 };
 
-/* ---- tombstones & resets locaux ---- */
-const KEY_CLIENT_TOMBSTONES = 'clients.tombstones';
-const KEY_SMS_HISTORY_RESETS = 'smsHistory.resets';
+/* ---- tombstones & resets ----
+   On passe les tombstones en **ID** (et non plus téléphone) pour
+   ne pas masquer d’autres fiches partageant le même numéro. */
+const KEY_CLIENT_TOMBSTONES = 'clients.tombstones';  // contient désormais des ids
+const KEY_SMS_HISTORY_RESETS = 'smsHistory.resets'; // toujours par téléphone
 type ResetMap = Record<string, string>;
 
 async function loadTombstones(): Promise<string[]> {
@@ -213,9 +178,10 @@ async function loadTombstones(): Promise<string[]> {
 async function saveTombstones(list: string[]) {
   try { await AsyncStorage.setItem(KEY_CLIENT_TOMBSTONES, JSON.stringify(Array.from(new Set(list)))); } catch {}
 }
-async function addTombstone(phoneKey: string) {
+async function addTombstoneId(id: string) {
+  if (!id) return;
   const list = await loadTombstones();
-  if (!list.includes(phoneKey)) { list.push(phoneKey); await saveTombstones(list); }
+  if (!list.includes(id)) { list.push(id); await saveTombstones(list); }
 }
 async function loadHistoryResets(): Promise<ResetMap> {
   try {
@@ -266,7 +232,7 @@ export default function ClientListPage() {
   const [clients, setClients] = useState<Client[]>([]);
   const [filteredClients, setFilteredClients] = useState<Client[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedClients, setSelectedClients] = useState<string[]>([]);
+  const [selectedClients, setSelectedClients] = useState<string[]>([]); // ⇐ IDs sélectionnés
   const [smsFilter, setSmsFilter] = useState<SMSCategory | 'Tous'>('Tous');
   const [sortMode, setSortMode] = useState<SortMode>('NAME_ASC');
   const [customMessages, setCustomMessages] = useState<Record<string, string | { title?: string; content: string }>>({});
@@ -309,14 +275,14 @@ export default function ClientListPage() {
       if (!licenceId) { setSyncError('Licence introuvable'); return; }
 
       const [tombstones, resets] = await Promise.all([loadTombstones(), loadHistoryResets()]);
-      const tombstoneSet = new Set(tombstones);
+      const tombstoneSet = new Set(tombstones); // ids
 
       // 1) Clients via service
       const rows = await fetchClientsOnce(licenceId, { force });
       const remote = (rows || [])
         .filter(r => !(r as any).deletedAt)
         .map(rowToClient)
-        .filter(c => !tombstoneSet.has(sanitizePhone(c.telephone)));
+        .filter(c => !tombstoneSet.has(String(c.id))); // filtre par id
 
       // 2) Historique licence
       const hist = await fetchSmsHistoryFromLicence(licenceId, cle);
@@ -339,31 +305,38 @@ export default function ClientListPage() {
       const withHistory = remote.map(c => {
         const logs = (byPhone.get(sanitizePhone(c.telephone)) || []).map(l => ({
           date: l.date,
-          type: l.type,     // "Lunettes"/"Lentilles"/"SAV"/"Commande"/"Marketing"/...
+          type: l.type,
         }));
         return { ...c, messagesEnvoyes: logs };
       });
 
-      // 4) Merge avec local en PRÉSERVANT le local
+      // 4) Merge avec local en PRÉSERVANT le local — **PAR ID**
       const localStr = await AsyncStorage.getItem('clients');
       const localRaw: any[] = localStr ? JSON.parse(localStr) : [];
       const local: Client[] = (Array.isArray(localRaw) ? localRaw : []).map((l: any) => {
         const tel = sanitizePhone(l.telephone || l.phone || '');
-        return { ...l, telephone: tel };
+        return { ...l, telephone: tel, id: String(l.id || `loc-${Math.random().toString(36).slice(2,8)}`) };
       });
 
-      const mergedByPhone = new Map<string, Client>();
-      for (const r of withHistory) mergedByPhone.set(sanitizePhone(r.telephone), r);
+      const mergedById = new Map<string, Client>();
+      for (const r of withHistory) mergedById.set(String(r.id), r);
 
       for (const l of local) {
-        const key = sanitizePhone(l.telephone);
-        if (!key) continue;
-        const cur = mergedByPhone.get(key);
+        const key = String(l.id);
+        const cur = mergedById.get(key);
 
         if (!cur) {
-          mergedByPhone.set(key, l);
-          continue;
+          // tentative de rapprochement si le serveur n'a pas d'id mais même téléphone… (rare)
+          const fallback = Array.from(mergedById.values()).find(x =>
+            !x.id && sanitizePhone(x.telephone) === sanitizePhone(l.telephone)
+          );
+          if (!fallback) {
+            mergedById.set(key, l);
+            continue;
+          }
         }
+
+        if (!cur) continue;
 
         const svcLocal = !!l?.consent?.service_sms?.value;
         const mktLocal = !!l?.consent?.marketing_sms?.value || !!l?.consentementMarketing;
@@ -372,7 +345,8 @@ export default function ClientListPage() {
 
         const merged: Client = {
           ...cur,
-          ...l, // le local écrase par défaut les champs simples
+          ...l, // local prioritaire
+          telephone: sanitizePhone(l.telephone || cur.telephone || ''),
           dateNaissance: l.dateNaissance || cur.dateNaissance || '',
           lunettes: l.lunettes ?? cur.lunettes,
           lentilles: (l.lentilles && l.lentilles.length) ? l.lentilles : cur.lentilles,
@@ -394,10 +368,10 @@ export default function ClientListPage() {
           })(),
         };
 
-        mergedByPhone.set(key, merged);
+        mergedById.set(key, merged);
       }
 
-      const merged = Array.from(mergedByPhone.values());
+      const merged = Array.from(mergedById.values());
       await AsyncStorage.setItem('clients', JSON.stringify(merged));
       setClients(merged);
     } catch (e: any) {
@@ -418,7 +392,7 @@ export default function ClientListPage() {
           const parsed: any[] = JSON.parse(clientData);
           const normalized: Client[] = (Array.isArray(parsed) ? parsed : []).map((c: any) => {
             const tel = sanitizePhone(c.telephone || c.phone || '');
-            return { ...c, telephone: tel };
+            return { ...c, telephone: tel, id: String(c.id || `loc-${Math.random().toString(36).slice(2,8)}`) };
           });
           setClients(normalized);
           await AsyncStorage.setItem('clients', JSON.stringify(normalized));
@@ -484,65 +458,54 @@ export default function ClientListPage() {
     setFilteredClients(result);
   }, [searchQuery, smsFilter, clients, sortMode]);
 
-  const toggleSelect = (rawPhone: string) => {
-    const phone = sanitizePhone(rawPhone);
-    if (!phone) return;
+  const toggleSelect = (clientId: string) => {
+    const id = String(clientId || '');
+    if (!id) return;
     setSelectedClients((prev) =>
-      prev.includes(phone) ? prev.filter((p) => p !== phone) : [...prev, phone]
+      prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id]
     );
   };
 
-  // suppression
-  const deleteClient = async (rawPhone: string) => {
-    const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est definitive.');
+  // suppression (par ID)
+  const deleteClientById = async (client: Client) => {
+    const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est définitive.');
     if (!ok) return;
 
-    const phone = sanitizePhone(rawPhone);
-    const target = clients.find(c => sanitizePhone(c.telephone) === phone);
-    const targetId = target?.id;
+    const targetId = String(client.id || '');
+    if (!targetId) return;
 
     // Optimiste local
-    const updated = clients.filter(c => sanitizePhone(c.telephone) !== phone);
+    const updated = clients.filter(c => String(c.id) !== targetId);
     setClients(updated);
-    setSelectedClients(prev => prev.filter(t => t !== phone));
+    setSelectedClients(prev => prev.filter(t => t !== targetId));
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
 
     try {
       const licenceId = await getStableLicenceId();
       if (!licenceId) throw new Error('LICENCE_ID_MISSING');
 
-      if (targetId) {
-        const del = await fetch(`${API_BASE}/api/clients/${encodeURIComponent(String(targetId))}?licenceId=${encodeURIComponent(licenceId)}`, {
-          method: 'DELETE',
-        });
-        if (!del.ok) throw new Error(`HTTP ${del.status}`);
-      } else {
-        await fetch(`${API_BASE}/api/clients/upsert`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            licenceId,
-            clients: [{ id: `loc-${phone}`, phone, telephone: phone, updatedAt: new Date().toISOString(), deletedAt: new Date().toISOString() }],
-          }),
-        });
-      }
+      const del = await fetch(`${API_BASE}/api/clients/${encodeURIComponent(String(targetId))}?licenceId=${encodeURIComponent(licenceId)}`, {
+        method: 'DELETE',
+      });
+      if (!del.ok) throw new Error(`HTTP ${del.status}`);
     } catch {
-      await addTombstone(phone);
+      // marquer comme supprimé localement (tombstone par id)
+      await addTombstoneId(targetId);
     }
   };
 
-  const resetClientHistory = async (rawPhone: string) => {
+  const resetClientHistory = async (client: Client) => {
     const ok = await confirmAsync(
-      'Reinitialiser l’historique ?',
+      'Réinitialiser l’historique ?',
       'Effacer l’historique des SMS de ce client ?',
-      'Reinitialiser'
+      'Réinitialiser'
     );
     if (!ok) return;
 
-    const phone = sanitizePhone(rawPhone);
+    const phone = sanitizePhone(client.telephone);
 
     const updated = clients.map((c) =>
-      sanitizePhone(c.telephone) === phone ? { ...c, messagesEnvoyes: [] } : c
+      String(c.id) === String(client.id) ? { ...c, messagesEnvoyes: [] } : c
     );
     setClients(updated);
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
@@ -596,7 +559,7 @@ export default function ClientListPage() {
 
   const openSmsDialog = () => {
     if (selectedClients.length === 0) {
-      Alert.alert('Info', 'Selectionne au moins un client.');
+      Alert.alert('Info', 'Sélectionne au moins un client.');
       return;
     }
     setTypeModalVisible(true);
@@ -604,9 +567,9 @@ export default function ClientListPage() {
 
   /** Construit la prévisualisation pour les clients sélectionnés (sans envoyer) */
   const openPreviewForCategory = async (category: SMSCategory | '__custom__') => {
-    const batch = clients.filter((c) => selectedClients.includes(sanitizePhone(c.telephone)));
+    const batch = clients.filter((c) => selectedClients.includes(String(c.id)));
     if (batch.length === 0) {
-      Alert.alert('Info', 'Selectionne au moins un client.');
+      Alert.alert('Info', 'Sélectionne au moins un client.');
       return;
     }
 
@@ -682,9 +645,9 @@ export default function ClientListPage() {
   };
 
   const sendBatch = async (category: SMSCategory | '__custom__') => {
-    const batch = clients.filter((c) => selectedClients.includes(sanitizePhone(c.telephone)));
+    const batch = clients.filter((c) => selectedClients.includes(String(c.id)));
     if (batch.length === 0) {
-      Alert.alert('Info', 'Selectionne au moins un client.');
+      Alert.alert('Info', 'Sélectionne au moins un client.');
       return;
     }
 
@@ -693,7 +656,7 @@ export default function ClientListPage() {
 
     const credits = await fetchCreditsFromServer(licenceId);
     if (credits !== null && credits < batch.length) {
-      Alert.alert('Credits insuffisants', `Credits: ${credits}, SMS requis: ${batch.length}.`);
+      Alert.alert('Crédits insuffisants', `Crédits: ${credits}, SMS requis: ${batch.length}.`);
       return;
     }
 
@@ -737,7 +700,7 @@ export default function ClientListPage() {
             category: category === '__custom__' ? 'Personnalisé' : (category as string),
           });
 
-          const idx = updated.findIndex((u) => sanitizePhone(u.telephone) === phone);
+          const idx = updated.findIndex((u) => String(u.id) === String(c.id));
           if (idx !== -1) {
             const ref = updated[idx] as any;
             if (!Array.isArray(ref.messagesEnvoyes)) ref.messagesEnvoyes = [];
@@ -773,9 +736,9 @@ export default function ClientListPage() {
   const renderItem = ({ item }: { item: Client }) => (
     <View style={styles.clientItem}>
       <View style={styles.clientRow}>
-        <TouchableOpacity onPress={() => toggleSelect(item.telephone)} style={{ flex: 1 }}>
+        <TouchableOpacity onPress={() => toggleSelect(String(item.id))} style={{ flex: 1 }}>
           <Text style={styles.clientText}>
-            {selectedClients.includes(sanitizePhone(item.telephone)) ? '☑ ' : '☐ '}
+            {selectedClients.includes(String(item.id)) ? '☑ ' : '☐ '}
             {item.prenom} {item.nom} {item.telephone ? `(${item.telephone})` : ''}
           </Text>
         </TouchableOpacity>
@@ -789,15 +752,15 @@ export default function ClientListPage() {
         </TouchableOpacity>
 
         <TouchableOpacity
-          onPress={() => resetClientHistory(item.telephone)}
+          onPress={() => resetClientHistory(item)}
           style={[styles.editButton, { marginLeft: 6 }]}
           hitSlop={{top:8,bottom:8,left:8,right:8}}
         >
-          <Text style={styles.editButtonText}>Reinitialiser</Text>
+          <Text style={styles.editButtonText}>Réinitialiser</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
-          onPress={() => deleteClient(item.telephone)}
+          onPress={() => deleteClientById(item)}
           style={[styles.deleteBtn, { marginLeft: 6 }]}
           hitSlop={{top:8,bottom:8,left:8,right:8}}
         >
@@ -811,7 +774,7 @@ export default function ClientListPage() {
             .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
             .map((msg, idx) => {
               const date = new Date(msg.date);
-              const formatted = `${date.toLocaleDateString()} a ${date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
+              const formatted = `${date.toLocaleDateString()} à ${date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
               return (
                 <Text key={idx} style={styles.smsHistoryText}>
                   - {msg.type} le {formatted}
@@ -897,11 +860,11 @@ export default function ClientListPage() {
 
       <FlatList
         data={filteredClients}
-        keyExtractor={(item, i) => sanitizePhone(item.telephone) || String(item.id || i)}
+        keyExtractor={(item, i) => String(item.id || i)}
         renderItem={renderItem}
       />
 
-      {/* Modale choix type -> ouvre la PREVIEW, ne lance plus l’envoi direct */}
+      {/* Modale choix type -> ouvre la PREVIEW */}
       <Modal visible={typeModalVisible} transparent animationType="fade" onRequestClose={() => setTypeModalVisible(false)}>
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
@@ -931,7 +894,7 @@ export default function ClientListPage() {
         </View>
       </Modal>
 
-      {/* Modale “Personnalisé” -> déclenche PREVIEW */}
+      {/* Modale “Personnalisé” -> PREVIEW */}
       <Modal visible={customModalVisible} transparent animationType="fade" onRequestClose={() => setCustomModalVisible(false)}>
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
@@ -963,7 +926,7 @@ export default function ClientListPage() {
         </View>
       </Modal>
 
-      {/* Modale Prévisualisation (avant la modale de progress) */}
+      {/* Modale Prévisualisation */}
       <Modal visible={previewVisible} transparent animationType="fade" onRequestClose={() => setPreviewVisible(false)}>
         <View style={styles.customOverlay}>
           <View style={[styles.customCard, { width: '90%' }]}>
@@ -1020,7 +983,7 @@ export default function ClientListPage() {
             <Text style={styles.progressTitle}>Envoi des SMS…</Text>
             {sendStep !== 'done' && sendStep !== 'error' && <ActivityIndicator size="large" color="#fff" />}
             <View style={{ marginTop: 12, alignItems: 'center' }}>
-              <Text style={styles.progressLine}>{sendStep === 'prep' ? '• Preparation…' : '✓ Preparation'}</Text>
+              <Text style={styles.progressLine}>{sendStep === 'prep' ? '• Préparation…' : '✓ Préparation'}</Text>
               <Text style={styles.progressLine}>{sendStep === 'send' ? '• Envoi au serveur…' : (sendStep === 'prep' ? '• Envoi au serveur' : '✓ Envoi au serveur')}</Text>
               <Text style={[styles.progressLine, { marginTop: 8 }]}>{progressCount} / {progressTotal}</Text>
               {sendStep === 'done' && batchSummary && (
