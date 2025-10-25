@@ -415,91 +415,96 @@ export default function AddClientPage() {
   const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>) => setter(prev => !prev);
 
   /** SAVE + SYNC SERVEUR */
-  const handleSave = useCallback(async () => {
-    const tel = sanitizePhone(telephone.trim());
-    if (!tel) return showToast('☎ Numéro obligatoire');
-    if (!isPhone10(tel)) return showToast('❌ Numéro invalide');
-    if (!nom.trim() || !prenom.trim()) return showToast('❌ Nom et prénom requis');
+ const handleSave = useCallback(async () => {
+  const tel = sanitizePhone(telephone.trim());
+  if (!tel) return showToast('☎ Numéro obligatoire');
+  if (!isPhone10(tel)) return showToast('❌ Numéro invalide');
+  if (!nom.trim() || !prenom.trim()) return showToast('❌ Nom et prénom requis');
 
-    const now = new Date().toISOString();
+  const now = new Date().toISOString();
 
-    const localClient: any = {
-      id: selectedExistingId || (client as any)?.id,
-      nom, prenom, telephone: tel, email,
-      dateNaissance,
-      lunettes,
-      lentilles: [journ30 && '30j', journ60 && '60j', journ90 && '90j', mens6 && '6mois', mens12 && '1an'].filter(Boolean),
-      consentementMarketing: consentMarketing,
-      consent: {
-        service_sms: { value: consentService, collectedAt: consentService ? now : undefined, source: 'in_store', proof: consentService ? 'case-cochée-app' : undefined, unsubscribedAt: null },
-        marketing_sms: { value: consentMarketing, collectedAt: consentMarketing ? now : undefined, source: 'in_store', proof: consentMarketing ? 'case-cochée-app' : undefined, unsubscribedAt: null },
-      },
-      messagesEnvoyes: mode === 'edit' ? (client as any)?.messagesEnvoyes || [] : [],
-      createdAt: mode === 'edit' ? (client as any)?.createdAt || now : now,
-      updatedAt: now,
-    };
+  const localClient: any = {
+    id: selectedExistingId || (client as any)?.id,
+    nom, prenom, telephone: tel, email,
+    dateNaissance,
+    lunettes,
+    lentilles: [journ30 && '30j', journ60 && '60j', journ90 && '90j', mens6 && '6mois', mens12 && '1an'].filter(Boolean),
+    consentementMarketing: consentMarketing,
+    consent: {
+      service_sms:   { value: consentService,   collectedAt: consentService ? now   : undefined, source: 'in_store', proof: consentService   ? 'case-cochée-app' : undefined, unsubscribedAt: null },
+      marketing_sms: { value: consentMarketing, collectedAt: consentMarketing ? now : undefined, source: 'in_store', proof: consentMarketing ? 'case-cochée-app' : undefined, unsubscribedAt: null },
+    },
+    messagesEnvoyes: mode === 'edit' ? (client as any)?.messagesEnvoyes || [] : [],
+    createdAt:      mode === 'edit' ? (client as any)?.createdAt      || now : now,
+    updatedAt: now,
+  };
 
-    // 1) Sauvegarde locale — UPDATE par id uniquement, sinon CREATE (même téléphone autorisé)
-    try {
-      const data = await AsyncStorage.getItem('clients');
-      let clients: any[] = data ? JSON.parse(data) : [];
+  // 1) 💾 Sauvegarde locale — UPDATE par id uniquement, sinon CREATE
+  try {
+    const data = await AsyncStorage.getItem('clients');
+    let clients: any[] = data ? JSON.parse(data) : [];
 
-      let idxExisting = -1;
-      if (localClient.id) {
-        idxExisting = clients.findIndex((c) => c.id === localClient.id);
-      }
-
-      if (idxExisting >= 0) {
-        clients[idxExisting] = { ...clients[idxExisting], ...localClient };
-      } else {
-        localClient.id = localClient.id || `c-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-        clients.push(localClient);
-      }
-      await AsyncStorage.setItem('clients', JSON.stringify(clients));
-      showToast('💾 Client enregistré (local)');
-    } catch (error) {
-      console.error('Erreur de sauvegarde locale :', error);
-      return showToast('❌ Échec sauvegarde locale');
+    // ✅ on ne cherche PLUS par téléphone ici
+    let idxExisting = -1;
+    if (localClient.id) {
+      idxExisting = clients.findIndex((c) => c.id === localClient.id);
     }
 
-    // 2) Push serveur (inclut consent)
-    try {
-      const licenceId = licenceIdRef.current || await getStableLicenceId();
-      licenceIdRef.current = licenceId;
-      if (!licenceId) { console.warn('LicenceId introuvable'); return; }
-      const serverClient = toServerClient(
-        { ...localClient, journ30, journ60, journ90, mens6, mens12 },
-        localClient.id
-      );
-      const resp = await fetch(`${SERVER_BASE}/api/clients/upsert`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ licenceId, clients: [serverClient] }),
-      });
-      if (!resp.ok) {
-        const t = await resp.text().catch(() => '');
-        console.error('Push serveur KO:', resp.status, t);
-        return showToast('⚠️ Synchro serveur échouée');
-      }
-      // Mise à jour locale par id UNIQUEMENT
-      const data2 = await AsyncStorage.getItem('clients');
-      let clients2: any[] = data2 ? JSON.parse(data2) : [];
-      const j = clients2.findIndex((c) => c.id === serverClient.id);
-      if (j >= 0) {
-        clients2[j].id = serverClient.id;
-        clients2[j].updatedAt = serverClient.updatedAt;
-        await AsyncStorage.setItem('clients', JSON.stringify(clients2));
-      }
-      showToast('☁️ Synchro serveur OK');
-    } catch (e) {
-      console.error('Synchro serveur erreur:', e);
-      showToast('⚠️ Pas de réseau / synchro différée');
+    if (idxExisting >= 0) {
+      clients[idxExisting] = { ...clients[idxExisting], ...localClient };
+    } else {
+      localClient.id = localClient.id || `c-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+      clients.push(localClient);
     }
-  }, [
-    telephone, nom, prenom, email, dateNaissance,
-    lunettes, journ30, journ60, journ90, mens6, mens12,
-    consentMarketing, consentService, client, mode, showToast, selectedExistingId
-  ]);
+    await AsyncStorage.setItem('clients', JSON.stringify(clients));
+    showToast('💾 Client enregistré (local)');
+  } catch (error) {
+    console.error('Erreur de sauvegarde locale :', error);
+    return showToast('❌ Échec sauvegarde locale');
+  }
+
+  // 2) ☁️ Push serveur (inclut consent)
+  try {
+    const licenceId = licenceIdRef.current || await getStableLicenceId();
+    licenceIdRef.current = licenceId;
+    if (!licenceId) { console.warn('LicenceId introuvable'); return; }
+
+    const serverClient = toServerClient(
+      { ...localClient, journ30, journ60, journ90, mens6, mens12 },
+      localClient.id
+    );
+
+    const resp = await fetch(`${SERVER_BASE}/api/clients/upsert`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ licenceId, clients: [serverClient] }),
+    });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '');
+      console.error('Push serveur KO:', resp.status, t);
+      return showToast('⚠️ Synchro serveur échouée');
+    }
+
+    // ✅ Mise à jour locale par id UNIQUEMENT (surtout pas par téléphone)
+    const data2 = await AsyncStorage.getItem('clients');
+    let clients2: any[] = data2 ? JSON.parse(data2) : [];
+    const j = clients2.findIndex((c) => c.id === serverClient.id);
+    if (j >= 0) {
+      clients2[j].id = serverClient.id;
+      clients2[j].updatedAt = serverClient.updatedAt;
+      await AsyncStorage.setItem('clients', JSON.stringify(clients2));
+    }
+    showToast('☁️ Synchro serveur OK');
+  } catch (e) {
+    console.error('Synchro serveur erreur:', e);
+    showToast('⚠️ Pas de réseau / synchro différée');
+  }
+}, [
+  telephone, nom, prenom, email, dateNaissance,
+  lunettes, journ30, journ60, journ90, mens6, mens12,
+  consentMarketing, consentService, client, mode, showToast, selectedExistingId
+]);
+
 
   /* =========================
    * Envoi SMS (transactionnel)

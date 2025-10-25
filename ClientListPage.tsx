@@ -56,9 +56,7 @@ const getSignatureFromSettings = async (): Promise<string> => {
     }
     const localSig = await AsyncStorage.getItem('signature');
     return (localSig || '').trim();
-  } catch {
-    return '';
-  }
+  } catch { return ''; }
 };
 
 const appendSignature = (msg: string, sig: string) => {
@@ -90,8 +88,6 @@ const getStableLicenceId = async (): Promise<string | null> => {
       const urls = [
         `${API_BASE}/api/licence/by-key?key=${encodeURIComponent(lic.licence)}`,
         `${API_BASE}/licence/by-key?key=${encodeURIComponent(lic.licence)}`,
-        `${API_BASE}/api/licence?cle=${encodeURIComponent(lic.licence)}`,
-        `${API_BASE}/licence?cle=${encodeURIComponent(lic.licence)}`
       ];
       for (const url of urls) {
         try {
@@ -118,6 +114,15 @@ type ServerSmsItem = {
   campaignName?: string; campaign?: string; title?: string; nom?: string; name?: string; template?: string;
 };
 
+const labelFromType = (t: string) => {
+  if (t === 'marketing') return 'Marketing';
+  if (t === 'transactional') return 'Transactionnel';
+  if (t === 'auto-anniv') return 'Anniv auto';
+  if (t === 'auto-renew') return 'Renouvellement auto';
+  return 'SMS';
+};
+
+/** essaie d’inférer une catégorie lisible pour l’historique */
 const coerceHistoryLabel = (rawType: string, label: string) => {
   const knownCats = ['Lunettes','Lentilles','SAV','Commande'] as const;
   if (knownCats.includes(label as any)) return label;
@@ -126,6 +131,35 @@ const coerceHistoryLabel = (rawType: string, label: string) => {
   if (rawType === 'auto-anniv') return 'Anniv auto';
   if (rawType === 'auto-renew') return 'Renouvellement auto';
   return label || 'SMS';
+};
+
+/** ✅ fonction BIEN définie et utilisée */
+const fetchSmsHistoryFromLicence = async (
+  licenceId: string,
+  cle?: string | null
+): Promise<ServerSmsItem[]> => {
+  const urls: string[] = [
+    `${API_BASE}/api/licence?id=${encodeURIComponent(licenceId)}`,
+  ];
+  if (cle) {
+    urls.push(
+      `${API_BASE}/api/licence?cle=${encodeURIComponent(cle)}`,
+      `${API_BASE}/licence?cle=${encodeURIComponent(cle)}`
+    );
+  }
+
+  for (const url of urls) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) continue;
+
+      const data = await r.json();
+      const lic = data?.licence ?? data;
+      const items: any[] = Array.isArray(lic?.historiqueSms) ? lic.historiqueSms : [];
+      return items as ServerSmsItem[];
+    } catch {}
+  }
+  return [];
 };
 
 /* ---- mapping service row -> Client local ---- */
@@ -138,11 +172,8 @@ const rowToClient = (s: ClientRow): Client => {
   const srvService =
     (s as any)?.consent?.service_sms?.value ?? (s as any)?.consentementService ?? true;
 
-  // IMPORTANT : id serveur prioritaire ; sinon fallback unique (mais on évite l’agrégation par téléphone plus tard)
-  const id = (s as any).id ? String((s as any).id) : `ph-${tel || Math.random().toString(36).slice(2,8)}`;
-
   return {
-    id,
+    id: String((s as any).id || (s as any)._id || `loc-${tel}`),
     prenom: (s as any).prenom || '',
     nom: (s as any).nom || '',
     telephone: tel,
@@ -161,11 +192,9 @@ const rowToClient = (s: ClientRow): Client => {
   };
 };
 
-/* ---- tombstones & resets ----
-   On passe les tombstones en **ID** (et non plus téléphone) pour
-   ne pas masquer d’autres fiches partageant le même numéro. */
-const KEY_CLIENT_TOMBSTONES = 'clients.tombstones';  // contient désormais des ids
-const KEY_SMS_HISTORY_RESETS = 'smsHistory.resets'; // toujours par téléphone
+/* ---- tombstones & resets locaux ---- */
+const KEY_CLIENT_TOMBSTONES = 'clients.tombstones';
+const KEY_SMS_HISTORY_RESETS = 'smsHistory.resets';
 type ResetMap = Record<string, string>;
 
 async function loadTombstones(): Promise<string[]> {
@@ -178,10 +207,9 @@ async function loadTombstones(): Promise<string[]> {
 async function saveTombstones(list: string[]) {
   try { await AsyncStorage.setItem(KEY_CLIENT_TOMBSTONES, JSON.stringify(Array.from(new Set(list)))); } catch {}
 }
-async function addTombstoneId(id: string) {
-  if (!id) return;
+async function addTombstone(phoneKey: string) {
   const list = await loadTombstones();
-  if (!list.includes(id)) { list.push(id); await saveTombstones(list); }
+  if (!list.includes(phoneKey)) { list.push(phoneKey); await saveTombstones(list); }
 }
 async function loadHistoryResets(): Promise<ResetMap> {
   try {
@@ -226,13 +254,17 @@ function safeDate(s?: string): number {
   return isFinite(t) ? t : 0;
 }
 
+/* ======= Helpers sélection par ID ======= */
+const getId = (c: Client, i?: number) =>
+  String(c.id || `loc-${sanitizePhone(c.telephone)}-${i ?? 0}`);
+
 export default function ClientListPage() {
   const navigation = useNavigation<NavigationProp<RootStackParamList>>();
 
   const [clients, setClients] = useState<Client[]>([]);
   const [filteredClients, setFilteredClients] = useState<Client[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedClients, setSelectedClients] = useState<string[]>([]); // ⇐ IDs sélectionnés
+  const [selectedClients, setSelectedClients] = useState<string[]>([]); // IDs
   const [smsFilter, setSmsFilter] = useState<SMSCategory | 'Tous'>('Tous');
   const [sortMode, setSortMode] = useState<SortMode>('NAME_ASC');
   const [customMessages, setCustomMessages] = useState<Record<string, string | { title?: string; content: string }>>({});
@@ -275,14 +307,14 @@ export default function ClientListPage() {
       if (!licenceId) { setSyncError('Licence introuvable'); return; }
 
       const [tombstones, resets] = await Promise.all([loadTombstones(), loadHistoryResets()]);
-      const tombstoneSet = new Set(tombstones); // ids
+      const tombstoneSet = new Set(tombstones);
 
       // 1) Clients via service
       const rows = await fetchClientsOnce(licenceId, { force });
       const remote = (rows || [])
         .filter(r => !(r as any).deletedAt)
         .map(rowToClient)
-        .filter(c => !tombstoneSet.has(String(c.id))); // filtre par id
+        .filter(c => !tombstoneSet.has(sanitizePhone(c.telephone)));
 
       // 2) Historique licence
       const hist = await fetchSmsHistoryFromLicence(licenceId, cle);
@@ -310,43 +342,28 @@ export default function ClientListPage() {
         return { ...c, messagesEnvoyes: logs };
       });
 
-      // 4) Merge avec local en PRÉSERVANT le local — **PAR ID**
+      // 4) Merge avec local (le local prévaut)
       const localStr = await AsyncStorage.getItem('clients');
       const localRaw: any[] = localStr ? JSON.parse(localStr) : [];
       const local: Client[] = (Array.isArray(localRaw) ? localRaw : []).map((l: any) => {
         const tel = sanitizePhone(l.telephone || l.phone || '');
-        return { ...l, telephone: tel, id: String(l.id || `loc-${Math.random().toString(36).slice(2,8)}`) };
+        return { ...l, telephone: tel };
       });
 
       const mergedById = new Map<string, Client>();
       for (const r of withHistory) mergedById.set(String(r.id), r);
-
       for (const l of local) {
-        const key = String(l.id);
-        const cur = mergedById.get(key);
-
-        if (!cur) {
-          // tentative de rapprochement si le serveur n'a pas d'id mais même téléphone… (rare)
-          const fallback = Array.from(mergedById.values()).find(x =>
-            !x.id && sanitizePhone(x.telephone) === sanitizePhone(l.telephone)
-          );
-          if (!fallback) {
-            mergedById.set(key, l);
-            continue;
-          }
-        }
-
-        if (!cur) continue;
-
+        const id = String(l.id);
+        const cur = mergedById.get(id);
+        if (!cur) { mergedById.set(id, l); continue; }
         const svcLocal = !!l?.consent?.service_sms?.value;
         const mktLocal = !!l?.consent?.marketing_sms?.value || !!l?.consentementMarketing;
         const svcRemote = !!cur?.consent?.service_sms?.value;
         const mktRemote = !!cur?.consent?.marketing_sms?.value || !!cur?.consentementMarketing;
 
-        const merged: Client = {
+        mergedById.set(id, {
           ...cur,
-          ...l, // local prioritaire
-          telephone: sanitizePhone(l.telephone || cur.telephone || ''),
+          ...l,
           dateNaissance: l.dateNaissance || cur.dateNaissance || '',
           lunettes: l.lunettes ?? cur.lunettes,
           lentilles: (l.lentilles && l.lentilles.length) ? l.lentilles : cur.lentilles,
@@ -366,9 +383,7 @@ export default function ClientListPage() {
             }
             return out;
           })(),
-        };
-
-        mergedById.set(key, merged);
+        });
       }
 
       const merged = Array.from(mergedById.values());
@@ -390,15 +405,13 @@ export default function ClientListPage() {
       if (clientData) {
         try {
           const parsed: any[] = JSON.parse(clientData);
-          const normalized: Client[] = (Array.isArray(parsed) ? parsed : []).map((c: any) => {
+          const normalized: Client[] = (Array.isArray(parsed) ? parsed : []).map((c: any, i: number) => {
             const tel = sanitizePhone(c.telephone || c.phone || '');
-            return { ...c, telephone: tel, id: String(c.id || `loc-${Math.random().toString(36).slice(2,8)}`) };
+            return { ...c, telephone: tel, id: c.id || `loc-${tel}-${i}` };
           });
           setClients(normalized);
           await AsyncStorage.setItem('clients', JSON.stringify(normalized));
-        } catch {
-          setClients([]);
-        }
+        } catch { setClients([]); }
       }
       if (messageData) {
         try { setCustomMessages(JSON.parse(messageData)); } catch {}
@@ -458,54 +471,58 @@ export default function ClientListPage() {
     setFilteredClients(result);
   }, [searchQuery, smsFilter, clients, sortMode]);
 
-  const toggleSelect = (clientId: string) => {
-    const id = String(clientId || '');
-    if (!id) return;
+  const toggleSelect = (id: string) => {
     setSelectedClients((prev) =>
       prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id]
     );
   };
 
-  // suppression (par ID)
-  const deleteClientById = async (client: Client) => {
-    const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est définitive.');
+  // suppression (par téléphone conservée)
+  const deleteClient = async (rawPhone: string) => {
+    const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est definitive.');
     if (!ok) return;
 
-    const targetId = String(client.id || '');
-    if (!targetId) return;
+    const phone = sanitizePhone(rawPhone);
+    const target = clients.find(c => sanitizePhone(c.telephone) === phone);
+    const targetId = target?.id;
 
-    // Optimiste local
-    const updated = clients.filter(c => String(c.id) !== targetId);
+    const updated = clients.filter(c => sanitizePhone(c.telephone) !== phone);
     setClients(updated);
-    setSelectedClients(prev => prev.filter(t => t !== targetId));
+    setSelectedClients(prev => prev.filter(t => t !== String(targetId)));
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
 
     try {
       const licenceId = await getStableLicenceId();
       if (!licenceId) throw new Error('LICENCE_ID_MISSING');
 
-      const del = await fetch(`${API_BASE}/api/clients/${encodeURIComponent(String(targetId))}?licenceId=${encodeURIComponent(licenceId)}`, {
-        method: 'DELETE',
-      });
-      if (!del.ok) throw new Error(`HTTP ${del.status}`);
+      if (targetId) {
+        const del = await fetch(`${API_BASE}/api/clients/${encodeURIComponent(String(targetId))}?licenceId=${encodeURIComponent(licenceId)}`, {
+          method: 'DELETE',
+        });
+        if (!del.ok) throw new Error(`HTTP ${del.status}`);
+      } else {
+        await fetch(`${API_BASE}/api/clients/upsert`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            licenceId,
+            clients: [{ id: `loc-${phone}`, phone, telephone: phone, updatedAt: new Date().toISOString(), deletedAt: new Date().toISOString() }],
+          }),
+        });
+      }
     } catch {
-      // marquer comme supprimé localement (tombstone par id)
-      await addTombstoneId(targetId);
+      await addTombstone(phone);
     }
   };
 
-  const resetClientHistory = async (client: Client) => {
-    const ok = await confirmAsync(
-      'Réinitialiser l’historique ?',
-      'Effacer l’historique des SMS de ce client ?',
-      'Réinitialiser'
-    );
+  const resetClientHistory = async (rawPhone: string) => {
+    const ok = await confirmAsync('Reinitialiser l’historique ?', 'Effacer l’historique des SMS de ce client ?', 'Reinitialiser');
     if (!ok) return;
 
-    const phone = sanitizePhone(client.telephone);
+    const phone = sanitizePhone(rawPhone);
 
     const updated = clients.map((c) =>
-      String(c.id) === String(client.id) ? { ...c, messagesEnvoyes: [] } : c
+      sanitizePhone(c.telephone) === phone ? { ...c, messagesEnvoyes: [] } : c
     );
     setClients(updated);
     await AsyncStorage.setItem('clients', JSON.stringify(updated));
@@ -559,17 +576,18 @@ export default function ClientListPage() {
 
   const openSmsDialog = () => {
     if (selectedClients.length === 0) {
-      Alert.alert('Info', 'Sélectionne au moins un client.');
+      Alert.alert('Info', 'Selectionne au moins un client.');
       return;
     }
     setTypeModalVisible(true);
   };
 
-  /** Construit la prévisualisation pour les clients sélectionnés (sans envoyer) */
+  /** Prévisualisation (clients sélectionnés par ID) */
   const openPreviewForCategory = async (category: SMSCategory | '__custom__') => {
-    const batch = clients.filter((c) => selectedClients.includes(String(c.id)));
+    const idSet = new Set(selectedClients);
+    const batch = clients.filter((c) => idSet.has(getId(c)));
     if (batch.length === 0) {
-      Alert.alert('Info', 'Sélectionne au moins un client.');
+      Alert.alert('Info', 'Selectionne au moins un client.');
       return;
     }
 
@@ -604,12 +622,7 @@ export default function ClientListPage() {
     category?: string;
   }) => {
     const e164 = toE164FR(phoneNumber);
-    const payload: any = {
-      licenceId,
-      phoneNumber: e164,
-      message,
-      category,
-    };
+    const payload: any = { licenceId, phoneNumber: e164, message, category };
 
     const resp = await fetch(SEND_SMS_ENDPOINT, {
       method: 'POST',
@@ -645,9 +658,10 @@ export default function ClientListPage() {
   };
 
   const sendBatch = async (category: SMSCategory | '__custom__') => {
-    const batch = clients.filter((c) => selectedClients.includes(String(c.id)));
+    const idSet = new Set(selectedClients);
+    const batch = clients.filter((c) => idSet.has(getId(c)));
     if (batch.length === 0) {
-      Alert.alert('Info', 'Sélectionne au moins un client.');
+      Alert.alert('Info', 'Selectionne au moins un client.');
       return;
     }
 
@@ -656,7 +670,7 @@ export default function ClientListPage() {
 
     const credits = await fetchCreditsFromServer(licenceId);
     if (credits !== null && credits < batch.length) {
-      Alert.alert('Crédits insuffisants', `Crédits: ${credits}, SMS requis: ${batch.length}.`);
+      Alert.alert('Credits insuffisants', `Credits: ${credits}, SMS requis: ${batch.length}.`);
       return;
     }
 
@@ -733,58 +747,62 @@ export default function ClientListPage() {
     }
   };
 
-  const renderItem = ({ item }: { item: Client }) => (
-    <View style={styles.clientItem}>
-      <View style={styles.clientRow}>
-        <TouchableOpacity onPress={() => toggleSelect(String(item.id))} style={{ flex: 1 }}>
-          <Text style={styles.clientText}>
-            {selectedClients.includes(String(item.id)) ? '☑ ' : '☐ '}
-            {item.prenom} {item.nom} {item.telephone ? `(${item.telephone})` : ''}
-          </Text>
-        </TouchableOpacity>
+  const renderItem = ({ item, index }: { item: Client; index: number }) => {
+    const id = getId(item, index);
+    const checked = selectedClients.includes(id);
+    return (
+      <View style={styles.clientItem}>
+        <View style={styles.clientRow}>
+          <TouchableOpacity onPress={() => toggleSelect(id)} style={{ flex: 1 }}>
+            <Text style={styles.clientText}>
+              {checked ? '☑ ' : '☐ '}
+              {item.prenom} {item.nom} {item.telephone ? `(${item.telephone})` : ''}
+            </Text>
+          </TouchableOpacity>
 
-        <TouchableOpacity
-          onPress={() => navigation.navigate('ClientDetails', { client: item })}
-          style={styles.editButton}
-          hitSlop={{top:8,bottom:8,left:8,right:8}}
-        >
-          <Text style={styles.editButtonText}>Modifier</Text>
-        </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => navigation.navigate('ClientDetails', { client: item })}
+            style={styles.editButton}
+            hitSlop={{top:8,bottom:8,left:8,right:8}}
+          >
+            <Text style={styles.editButtonText}>Modifier</Text>
+          </TouchableOpacity>
 
-        <TouchableOpacity
-          onPress={() => resetClientHistory(item)}
-          style={[styles.editButton, { marginLeft: 6 }]}
-          hitSlop={{top:8,bottom:8,left:8,right:8}}
-        >
-          <Text style={styles.editButtonText}>Réinitialiser</Text>
-        </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => resetClientHistory(item.telephone)}
+            style={[styles.editButton, { marginLeft: 6 }]}
+            hitSlop={{top:8,bottom:8,left:8,right:8}}
+          >
+            <Text style={styles.editButtonText}>Reinitialiser</Text>
+          </TouchableOpacity>
 
-        <TouchableOpacity
-          onPress={() => deleteClientById(item)}
-          style={[styles.deleteBtn, { marginLeft: 6 }]}
-          hitSlop={{top:8,bottom:8,left:8,right:8}}
-        >
-          <Text style={styles.deleteBtnText}>Supprimer</Text>
-        </TouchableOpacity>
-      </View>
-
-      {item.messagesEnvoyes?.length > 0 && (
-        <View style={styles.smsHistory}>
-          {[...item.messagesEnvoyes]
-            .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-            .map((msg, idx) => {
-              const date = new Date(msg.date);
-              const formatted = `${date.toLocaleDateString()} à ${date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
-              return (
-                <Text key={idx} style={styles.smsHistoryText}>
-                  - {msg.type} le {formatted}
-                </Text>
-              );
-            })}
+          <TouchableOpacity
+            onPress={() => deleteClient(item.telephone)}
+            style={[styles.deleteBtn, { marginLeft: 6 }]}
+            hitSlop={{top:8,bottom:8,left:8,right:8}}
+          >
+            <Text style={styles.deleteBtnText}>Supprimer</Text>
+          </TouchableOpacity>
         </View>
-      )}
-    </View>
-  );
+
+        {item.messagesEnvoyes?.length > 0 && (
+          <View style={styles.smsHistory}>
+            {[...item.messagesEnvoyes]
+              .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+              .map((msg, idx) => {
+                const date = new Date(msg.date);
+                const formatted = `${date.toLocaleDateString()} a ${date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
+                return (
+                  <Text key={idx} style={styles.smsHistoryText}>
+                    - {msg.type} le {formatted}
+                  </Text>
+                );
+              })}
+          </View>
+        )}
+      </View>
+    );
+  };
 
   const selectedCount = selectedClients.length;
   const hasSelection = selectedCount > 0;
@@ -860,7 +878,7 @@ export default function ClientListPage() {
 
       <FlatList
         data={filteredClients}
-        keyExtractor={(item, i) => String(item.id || i)}
+        keyExtractor={(item, i) => getId(item, i)}
         renderItem={renderItem}
       />
 
@@ -894,7 +912,7 @@ export default function ClientListPage() {
         </View>
       </Modal>
 
-      {/* Modale “Personnalisé” -> PREVIEW */}
+      {/* Modale “Personnalisé” -> déclenche PREVIEW */}
       <Modal visible={customModalVisible} transparent animationType="fade" onRequestClose={() => setCustomModalVisible(false)}>
         <View style={styles.customOverlay}>
           <View style={styles.customCard}>
@@ -983,7 +1001,7 @@ export default function ClientListPage() {
             <Text style={styles.progressTitle}>Envoi des SMS…</Text>
             {sendStep !== 'done' && sendStep !== 'error' && <ActivityIndicator size="large" color="#fff" />}
             <View style={{ marginTop: 12, alignItems: 'center' }}>
-              <Text style={styles.progressLine}>{sendStep === 'prep' ? '• Préparation…' : '✓ Préparation'}</Text>
+              <Text style={styles.progressLine}>{sendStep === 'prep' ? '• Preparation…' : '✓ Preparation'}</Text>
               <Text style={styles.progressLine}>{sendStep === 'send' ? '• Envoi au serveur…' : (sendStep === 'prep' ? '• Envoi au serveur' : '✓ Envoi au serveur')}</Text>
               <Text style={[styles.progressLine, { marginTop: 8 }]}>{progressCount} / {progressTotal}</Text>
               {sendStep === 'done' && batchSummary && (
