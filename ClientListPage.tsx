@@ -403,16 +403,23 @@ export default function ClientListPage() {
       const clientData = await AsyncStorage.getItem('clients');
       const messageData = await AsyncStorage.getItem('messages');
       if (clientData) {
-        try {
-          const parsed: any[] = JSON.parse(clientData);
-          const normalized: Client[] = (Array.isArray(parsed) ? parsed : []).map((c: any, i: number) => {
-            const tel = sanitizePhone(c.telephone || c.phone || '');
-            return { ...c, telephone: tel, id: c.id || `loc-${tel}-${i}` };
-          });
-          setClients(normalized);
-          await AsyncStorage.setItem('clients', JSON.stringify(normalized));
-        } catch { setClients([]); }
-      }
+  try {
+    const parsed: any[] = JSON.parse(clientData);
+    const normalized: Client[] = (Array.isArray(parsed) ? parsed : []).map((c: any) => {
+      const tel = sanitizePhone(c.telephone || c.phone || '');
+      return {
+        ...c,
+        id: c.id || `c-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+        telephone: tel,
+      };
+    });
+    setClients(normalized);
+    await AsyncStorage.setItem('clients', JSON.stringify(normalized));
+  } catch {
+    setClients([]);
+  }
+}
+
       if (messageData) {
         try { setCustomMessages(JSON.parse(messageData)); } catch {}
       }
@@ -478,42 +485,33 @@ export default function ClientListPage() {
   };
 
   // suppression (par téléphone conservée)
-  const deleteClient = async (rawPhone: string) => {
-    const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est definitive.');
-    if (!ok) return;
+  // ❌ ancien deleteClient(rawPhone: string)
+// ✅ nouveau : on supprime par id unique
+const deleteClient = async (clientId: string) => {
+  const ok = await confirmAsync('Supprimer ce client ?', 'Cette action est definitive.');
+  if (!ok) return;
 
-    const phone = sanitizePhone(rawPhone);
-    const target = clients.find(c => sanitizePhone(c.telephone) === phone);
-    const targetId = target?.id;
+  // Optimiste local : on retire uniquement l’ID visé
+  const updated = clients.filter(c => String(c.id) !== String(clientId));
+  setClients(updated);
+  await AsyncStorage.setItem('clients', JSON.stringify(updated));
 
-    const updated = clients.filter(c => sanitizePhone(c.telephone) !== phone);
-    setClients(updated);
-    setSelectedClients(prev => prev.filter(t => t !== String(targetId)));
-    await AsyncStorage.setItem('clients', JSON.stringify(updated));
+  try {
+    const licenceId = await getStableLicenceId();
+    if (!licenceId) throw new Error('LICENCE_ID_MISSING');
 
-    try {
-      const licenceId = await getStableLicenceId();
-      if (!licenceId) throw new Error('LICENCE_ID_MISSING');
+    // Suppression serveur par ID si possible
+    const del = await fetch(
+      `${API_BASE}/api/clients/${encodeURIComponent(String(clientId))}?licenceId=${encodeURIComponent(licenceId)}`,
+      { method: 'DELETE' }
+    );
+    if (!del.ok) throw new Error(`HTTP ${del.status}`);
+  } catch {
+    // en cas d’échec réseau on ne tente PAS de tombstone par téléphone
+    // car cela impacterait d’autres fiches partageant le même numéro
+  }
+};
 
-      if (targetId) {
-        const del = await fetch(`${API_BASE}/api/clients/${encodeURIComponent(String(targetId))}?licenceId=${encodeURIComponent(licenceId)}`, {
-          method: 'DELETE',
-        });
-        if (!del.ok) throw new Error(`HTTP ${del.status}`);
-      } else {
-        await fetch(`${API_BASE}/api/clients/upsert`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            licenceId,
-            clients: [{ id: `loc-${phone}`, phone, telephone: phone, updatedAt: new Date().toISOString(), deletedAt: new Date().toISOString() }],
-          }),
-        });
-      }
-    } catch {
-      await addTombstone(phone);
-    }
-  };
 
   const resetClientHistory = async (rawPhone: string) => {
     const ok = await confirmAsync('Reinitialiser l’historique ?', 'Effacer l’historique des SMS de ce client ?', 'Reinitialiser');
@@ -777,12 +775,13 @@ export default function ClientListPage() {
           </TouchableOpacity>
 
           <TouchableOpacity
-            onPress={() => deleteClient(item.telephone)}
-            style={[styles.deleteBtn, { marginLeft: 6 }]}
-            hitSlop={{top:8,bottom:8,left:8,right:8}}
-          >
-            <Text style={styles.deleteBtnText}>Supprimer</Text>
-          </TouchableOpacity>
+  onPress={() => deleteClient(String(item.id))}
+  style={[styles.deleteBtn, { marginLeft: 6 }]}
+  hitSlop={{top:8,bottom:8,left:8,right:8}}
+>
+  <Text style={styles.deleteBtnText}>Supprimer</Text>
+</TouchableOpacity>
+
         </View>
 
         {item.messagesEnvoyes?.length > 0 && (
@@ -877,10 +876,11 @@ export default function ClientListPage() {
       </View>
 
       <FlatList
-        data={filteredClients}
-        keyExtractor={(item, i) => getId(item, i)}
-        renderItem={renderItem}
-      />
+  data={filteredClients}
+  keyExtractor={(item, i) => String(item.id || `${sanitizePhone(item.telephone)}-${i}`)}
+  renderItem={renderItem}
+/>
+
 
       {/* Modale choix type -> ouvre la PREVIEW */}
       <Modal visible={typeModalVisible} transparent animationType="fade" onRequestClose={() => setTypeModalVisible(false)}>

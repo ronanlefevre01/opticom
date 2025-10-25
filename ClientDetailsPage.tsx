@@ -69,54 +69,27 @@ export default function ClientDetailsPage() {
   };
 
   const handleDelete = async () => {
-    Alert.alert(
-      'Supprimer le client',
-      `Confirmer la suppression de ${client.prenom} ${client.nom} ?`,
-      [
-        { text: 'Annuler', style: 'cancel' },
-        {
-          text: 'Supprimer',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              const stored = await AsyncStorage.getItem('clients');
-              const list: Client[] = stored ? JSON.parse(stored) : [];
-
-              // ➜ suppression par ID pour ne PAS supprimer les autres fiches avec le même numéro
-              const targetId = String(client.id || '');
-              const updated = targetId
-                ? list.filter((c) => String(c.id) !== targetId)
-                : list.filter((c) => sanitizePhone(c.telephone) !== sanitizePhone(client.telephone));
-
-              await AsyncStorage.setItem('clients', JSON.stringify(updated));
-
-              // Tentative de suppression côté serveur (best-effort)
-              try {
-                const licenceId = await getStableLicenceId();
-                if (licenceId && targetId) {
-                  const resp = await fetch(
-                    `${API_BASE}/api/clients/${encodeURIComponent(targetId)}?licenceId=${encodeURIComponent(licenceId)}`,
-                    { method: 'DELETE' }
-                  );
-                  // Pas de blocage si erreur serveur : on reste en cohérence locale
-                  if (!resp.ok) {
-                    console.warn('Suppression serveur non confirmée:', resp.status);
-                  }
-                }
-              } catch (e) {
-                console.warn('Erreur suppression serveur:', e);
-              }
-
-              Alert.alert('Client supprimé');
-              navigation.navigate('ClientList');
-            } catch (e) {
-              Alert.alert('Erreur', 'Impossible de supprimer ce client.');
-            }
-          },
+  Alert.alert(
+    'Supprimer le client',
+    `Confirmer la suppression de ${client.prenom} ${client.nom} ?`,
+    [
+      { text: 'Annuler', style: 'cancel' },
+      {
+        text: 'Supprimer',
+        style: 'destructive',
+        onPress: async () => {
+          const stored = await AsyncStorage.getItem('clients');
+          const list: Client[] = stored ? JSON.parse(stored) : [];
+          const updated = list.filter((c) => String(c.id) !== String(client.id));
+          await AsyncStorage.setItem('clients', JSON.stringify(updated));
+          Alert.alert('Client supprimé');
+          navigation.navigate('ClientList');
         },
-      ]
-    );
-  };
+      },
+    ]
+  );
+};
+
 
   const produits =
     client.lunettes || client.lentilles?.length

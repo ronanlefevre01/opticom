@@ -337,26 +337,31 @@ export default function AddClientPage() {
   }, []);
 
   const handlePhoneChange = useCallback((val: string) => {
-    const clean = sanitizePhone(val);
-    setTelephone(clean);
-    setSelectedExistingId(null);
+  const clean = sanitizePhone(val);
+  setTelephone(clean);
 
-    if (debounceRef.current) clearTimeout(debounceRef.current);
+  // 🚫 Si on modifie un client existant, ne pas déclencher la recherche
+  if (selectedExistingId) {
+    return; // on laisse l’utilisateur modifier librement son numéro
+  }
 
-    if (clean.length < 6) {
-      setSuggestions([]);
-      setShowSug(false);
-      return;
-    }
+  if (debounceRef.current) clearTimeout(debounceRef.current);
 
-    debounceRef.current = setTimeout(async () => {
-      setLoadingSug(true);
-      const res = await searchClientsRemote(clean);
-      setSuggestions(res || []);
-      setShowSug(true);
-      setLoadingSug(false);
-    }, 220);
-  }, [searchClientsRemote]);
+  if (clean.length < 6) {
+    setSuggestions([]);
+    setShowSug(false);
+    return;
+  }
+
+  debounceRef.current = setTimeout(async () => {
+    setLoadingSug(true);
+    const res = await searchClientsRemote(clean);
+    setSuggestions(res || []);
+    setShowSug(true);
+    setLoadingSug(false);
+  }, 220);
+}, [searchClientsRemote, selectedExistingId]);
+
 
   /** Remplit tous les champs depuis un objet "complet" (inclut consentements coercés) */
   const hydrateFrom = useCallback((c: any) => {
@@ -399,6 +404,7 @@ export default function AddClientPage() {
     if (!full) full = c;
 
     hydrateFrom(full);
+    setSelectedExistingId(String(full.id || ''));
 
     setToast({ visible: true, text: '📂 Dossier chargé' });
     setTimeout(() => setToast({ visible: false, text: '' }), 1200);
