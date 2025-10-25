@@ -364,34 +364,37 @@ export default function AddClientPage() {
 
 
   /** Remplit tous les champs depuis un objet "complet" (inclut consentements coercés) */
-  const hydrateFrom = useCallback((c: any) => {
-    const phone = sanitizePhone(c.phone || c.telephone || telephone);
-    setSelectedExistingId(String(c.id || ''));
-    setTelephone(phone);
-    setNom(String(c.nom || ''));
-    setPrenom(String(c.prenom || ''));
-    setEmail(String(c.email || ''));
+  // ⛔️ ancienne version : dépendait de [telephone] et utilisait ... || telephone
+// ✅ nouvelle version : pas de dépendances, pas de fallback sur l'état courant
+const hydrateFrom = useCallback((c: any) => {
+  const phone = sanitizePhone(c.phone || c.telephone || ''); // <- plus de "|| telephone"
+  setSelectedExistingId(String(c.id || ''));
+  setTelephone(phone);
+  setNom(String(c.nom || ''));
+  setPrenom(String(c.prenom || ''));
+  setEmail(String(c.email || ''));
 
-    // produits / lentilles
-    setLunettes(!!c.lunettes);
-    const arr: string[] = Array.isArray(c.lentilles) ? c.lentilles : [];
-    setJourn30(arr.includes('30j'));
-    setJourn60(arr.includes('60j'));
-    setJourn90(arr.includes('90j'));
-    setMens6(arr.includes('6mois'));
-    setMens12(arr.includes('1an'));
+  // Produits / lentilles
+  setLunettes(!!c.lunettes);
+  const arr: string[] = Array.isArray(c.lentilles) ? c.lentilles : [];
+  setJourn30(arr.includes('30j'));
+  setJourn60(arr.includes('60j'));
+  setJourn90(arr.includes('90j'));
+  setMens6(arr.includes('6mois'));
+  setMens12(arr.includes('1an'));
 
-    // consentements (coercion robuste)
-    const cc = coerceConsent(c);
-    setConsentService(!!cc.service);
-    setConsentMarketing(!!cc.marketing);
+  // Consentements
+  const cc = coerceConsent(c);
+  setConsentService(!!cc.service);
+  setConsentMarketing(!!cc.marketing);
 
-    // date naissance
-    const dn = String(c.dateNaissance || c.naissance || '');
-    const mt = dn.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
-    if (mt) { setBDay(mt[1].padStart(2,'0')); setBMonth(mt[2].padStart(2,'0')); setBYear(mt[3]); }
-    else { setBDay(''); setBMonth(''); setBYear(''); }
-  }, [telephone]);
+  // Date de naissance
+  const dn = String(c.dateNaissance || c.naissance || '');
+  const mt = dn.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+  if (mt) { setBDay(mt[1].padStart(2,'0')); setBMonth(mt[2].padStart(2,'0')); setBYear(mt[3]); }
+  else { setBDay(''); setBMonth(''); setBYear(''); }
+}, []); // <- AUCUNE dépendance
+
 
   const selectSuggestion = useCallback(async (c: LightClient) => {
     setShowSug(false);
@@ -412,11 +415,15 @@ export default function AddClientPage() {
 
   // Pré-remplissage + chargement modèles
   useEffect(() => {
-    if (mode === 'edit' && client) {
-      hydrateFrom(client as any);
-    }
-    AsyncStorage.getItem('messages').then((data) => { if (!data) return; try { setMessages(JSON.parse(data)); } catch {} });
-  }, [mode, client, hydrateFrom]);
+  if (mode === 'edit' && client) {
+    hydrateFrom(client as any);
+  }
+  AsyncStorage.getItem('messages').then((data) => {
+    if (!data) return;
+    try { setMessages(JSON.parse(data)); } catch {}
+  });
+}, [mode, client]); // <- enlever "hydrateFrom" des deps
+
 
   const toggle = (setter: React.Dispatch<React.SetStateAction<boolean>>) => setter(prev => !prev);
 
